@@ -456,7 +456,7 @@ func withInsightsArchive(
 ) error {
 	out := cmd.OutOrStdout()
 	if dbPath == "" {
-		dbPath = defaultDBPath("garmin-pp-cli")
+		dbPath = garminArchivePath(cmd.Context(), cmd.ErrOrStderr())
 	}
 	db, err := store.OpenWithContext(cmd.Context(), dbPath)
 	if err != nil {
@@ -524,7 +524,7 @@ average names the number of nights that fed it.`,
 	cmd.Flags().IntVar(&days, "days", 28, "Number of calendar days to summarise, ending today. Ignore it and pass --from/--to for an explicit range.")
 	cmd.Flags().StringVar(&fromDay, "from", "", "First calendar day to summarise (YYYY-MM-DD). With --to, names an explicit range; alone, runs from that day through today.")
 	cmd.Flags().StringVar(&toDay, "to", "", "Last calendar day to summarise (YYYY-MM-DD). Alone, ends a --days-long window on that day.")
-	cmd.Flags().StringVar(&dbPath, "db", "", "SQLite database file path. The default is resolved from this home's data directory, where the archive is named for the credential in use (data-<hash>.db) unless an unscoped data.db already exists there; pass --db to pin one file across credential rotations.")
+	cmd.Flags().StringVar(&dbPath, "db", "", "SQLite database file path. The default is this home's data directory data.db, which is named for the home rather than for the credential in use, so a token refresh never orphans it; pass --db to read or write a different file.")
 	return cmd
 }
 
@@ -727,7 +727,7 @@ zero days rather than an error.`,
 	cmd.Flags().IntVar(&days, "days", 28, "Number of calendar days to summarise, ending today. Ignore it and pass --from/--to for an explicit range.")
 	cmd.Flags().StringVar(&fromDay, "from", "", "First calendar day to summarise (YYYY-MM-DD). With --to, names an explicit range; alone, runs from that day through today.")
 	cmd.Flags().StringVar(&toDay, "to", "", "Last calendar day to summarise (YYYY-MM-DD). Alone, ends a --days-long window on that day.")
-	cmd.Flags().StringVar(&dbPath, "db", "", "SQLite database file path. The default is resolved from this home's data directory, where the archive is named for the credential in use (data-<hash>.db) unless an unscoped data.db already exists there; pass --db to pin one file across credential rotations.")
+	cmd.Flags().StringVar(&dbPath, "db", "", "SQLite database file path. The default is this home's data directory data.db, which is named for the home rather than for the credential in use, so a token refresh never orphans it; pass --db to read or write a different file.")
 	return cmd
 }
 

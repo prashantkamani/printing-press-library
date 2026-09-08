@@ -10,11 +10,13 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -982,5 +984,212 @@ func TestActivityFeedPaginatesOnTheWireParamName(t *testing.T) {
 	}
 	if got.limitParam != "limit" {
 		t.Fatalf("limitParam = %q, want %q", got.limitParam, "limit")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Archive path (N131.4 F2 / TB-F11)
+// ---------------------------------------------------------------------------
+
+// archiveHome points every path resolver at a scratch home and returns the
+// data directory the generated resolver reads.
+func archiveHome(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("GARMIN_HOME", home)
+	dir := filepath.Dir(defaultDBPath("garmin-pp-cli"))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("make data dir: %v", err)
+	}
+	return dir
+}
+
+// Functional: a home that has never been synced gets the one archive name the
+// design names, and it is created rather than merely returned, so the
+// generated resolver's "an unscoped archive exists" branch takes over for
+// sync, analytics and search too.
+func TestArchivePathCreatesTheUnscopedArchiveInAFreshHome(t *testing.T) {
+	dir := archiveHome(t)
+	var warn strings.Builder
+
+	got := garminArchivePath(context.Background(), &warn)
+
+	want := filepath.Join(dir, "data.db")
+	if got != want {
+		t.Fatalf("archive path = %q, want %q", got, want)
+	}
+	info, err := os.Stat(want)
+	if err != nil {
+		t.Fatalf("data.db was not created: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("data.db mode = %o, want 600", perm)
+	}
+	if warn.String() != "" {
+		t.Fatalf("a fresh home warned: %q", warn.String())
+	}
+
+	// The generated resolver must now agree, even with a credential scope set.
+	setDefaultDBScopeCredential("Bearer synthetic-not-a-real-token")
+	t.Cleanup(func() { setDefaultDBScopeCredential("") })
+	if generated := defaultDBPath("garmin-pp-cli"); generated != want {
+		t.Fatalf("the generated resolver still returns %q, want %q", generated, want)
+	}
+}
+
+// Functional: an archive already written under a token-scoped name is renamed
+// rather than orphaned, its rows survive, and the rename is announced once.
+func TestArchivePathRenamesATokenScopedArchiveSoItsRowsAreNotOrphaned(t *testing.T) {
+	dir := archiveHome(t)
+	scoped := filepath.Join(dir, "data-0123456789ab.db")
+
+	db, err := store.OpenWithContext(context.Background(), scoped)
+	if err != nil {
+		t.Fatalf("open scoped archive: %v", err)
+	}
+	if err := db.EnsureGarminSeriesState(); err != nil {
+		t.Fatalf("ensure series state: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close scoped archive: %v", err)
+	}
+	before, err := os.ReadFile(scoped)
+	if err != nil {
+		t.Fatalf("read scoped archive: %v", err)
+	}
+
+	var warn strings.Builder
+	got := garminArchivePath(context.Background(), &warn)
+
+	want := filepath.Join(dir, "data.db")
+	if got != want {
+		t.Fatalf("archive path = %q, want %q", got, want)
+	}
+	if _, err := os.Stat(scoped); !os.IsNotExist(err) {
+		t.Fatalf("the scoped archive is still there (stat err = %v)", err)
+	}
+	after, err := os.ReadFile(want)
+	if err != nil {
+		t.Fatalf("read renamed archive: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("the renamed archive is not the same bytes (%d before, %d after)", len(before), len(after))
+	}
+	notice := warn.String()
+	if !strings.Contains(notice, "data-0123456789ab.db") || !strings.Contains(notice, "data.db") {
+		t.Fatalf("rename notice does not name both files: %q", notice)
+	}
+	if strings.Count(notice, "notice: renamed") != 1 {
+		t.Fatalf("rename announced %d times, want once: %q", strings.Count(notice, "notice: renamed"), notice)
+	}
+
+	// The renamed file is still a working archive.
+	reopened, err := store.OpenWithContext(context.Background(), want)
+	if err != nil {
+		t.Fatalf("reopen renamed archive: %v", err)
+	}
+	_ = reopened.Close()
+}
+
+// Negative: a WAL sidecar must not be stranded by the rename. This is the
+// state a `history` run leaves behind if the process is killed, and the
+// committed rows live in the -wal until a checkpoint folds them back in.
+func TestArchivePathCarriesAWALSidecarThroughTheRename(t *testing.T) {
+	dir := archiveHome(t)
+	scoped := filepath.Join(dir, "data-0123456789ab.db")
+	if err := garminPinArchive(scoped); err != nil {
+		t.Fatalf("pin scoped archive: %v", err)
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := os.WriteFile(scoped+suffix, []byte("stale sidecar"), 0o600); err != nil {
+			t.Fatalf("write sidecar: %v", err)
+		}
+	}
+
+	var warn strings.Builder
+	if got := garminArchivePath(context.Background(), &warn); got != filepath.Join(dir, "data.db") {
+		t.Fatalf("archive path = %q", got)
+	}
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		if _, err := os.Stat(scoped + suffix); !os.IsNotExist(err) {
+			t.Fatalf("scoped%s survived the migration (stat err = %v)", suffix, err)
+		}
+	}
+}
+
+// Negative: when both names exist nothing is renamed, because a rename would
+// overwrite. The novel commands take the unscoped file and the warning has to
+// name the consequence — the generated commands prefer the scoped one, so they
+// are writing a different archive.
+func TestArchivePathPrefersTheUnscopedArchiveAndNamesTheOrphan(t *testing.T) {
+	dir := archiveHome(t)
+	unscoped := filepath.Join(dir, "data.db")
+	scoped := filepath.Join(dir, "data-0123456789ab.db")
+	for _, p := range []string{unscoped, scoped} {
+		if err := garminPinArchive(p); err != nil {
+			t.Fatalf("pin %s: %v", p, err)
+		}
+	}
+
+	var warn strings.Builder
+	if got := garminArchivePath(context.Background(), &warn); got != unscoped {
+		t.Fatalf("archive path = %q, want %q", got, unscoped)
+	}
+	if _, err := os.Stat(scoped); err != nil {
+		t.Fatalf("the scoped archive was touched: %v", err)
+	}
+	msg := warn.String()
+	for _, want := range []string{"data-0123456789ab.db", "data.db", "sync", "analytics", "search", "--db"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("orphan warning missing %q: %q", want, msg)
+		}
+	}
+}
+
+// Negative: two scoped archives and no unscoped one. Renaming either would
+// discard the other, so an empty archive is started and both are named.
+func TestArchivePathRefusesToChooseBetweenTwoScopedArchives(t *testing.T) {
+	dir := archiveHome(t)
+	first := filepath.Join(dir, "data-0123456789ab.db")
+	second := filepath.Join(dir, "data-ba9876543210.db")
+	for _, p := range []string{first, second} {
+		if err := garminPinArchive(p); err != nil {
+			t.Fatalf("pin %s: %v", p, err)
+		}
+	}
+
+	var warn strings.Builder
+	if got := garminArchivePath(context.Background(), &warn); got != filepath.Join(dir, "data.db") {
+		t.Fatalf("archive path = %q", got)
+	}
+	for _, p := range []string{first, second} {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("%s was discarded: %v", p, err)
+		}
+	}
+	msg := warn.String()
+	if !strings.Contains(msg, "data-0123456789ab.db") || !strings.Contains(msg, "data-ba9876543210.db") {
+		t.Fatalf("warning does not name both scoped archives: %q", msg)
+	}
+}
+
+// Boundary: only the generated resolver's own name shape counts as a scoped
+// archive. An unrelated file that merely starts with "data-" is left alone.
+func TestArchivePathIgnoresFilesThatAreNotScopedArchives(t *testing.T) {
+	dir := archiveHome(t)
+	decoy := filepath.Join(dir, "data-export.db")
+	if err := garminPinArchive(decoy); err != nil {
+		t.Fatalf("pin decoy: %v", err)
+	}
+
+	var warn strings.Builder
+	if got := garminArchivePath(context.Background(), &warn); got != filepath.Join(dir, "data.db") {
+		t.Fatalf("archive path = %q", got)
+	}
+	if _, err := os.Stat(decoy); err != nil {
+		t.Fatalf("the decoy was renamed: %v", err)
+	}
+	if warn.String() != "" {
+		t.Fatalf("the decoy triggered a warning: %q", warn.String())
 	}
 }

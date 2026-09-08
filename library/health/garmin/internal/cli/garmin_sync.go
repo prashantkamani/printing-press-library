@@ -23,6 +23,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -1451,7 +1454,7 @@ explicit choice, not a default.`,
 			c.NoCache = true
 
 			if dbPath == "" {
-				dbPath = defaultDBPath("garmin-pp-cli")
+				dbPath = garminArchivePath(cmd.Context(), cmd.ErrOrStderr())
 			}
 			db, err := store.OpenWithContext(cmd.Context(), dbPath)
 			if err != nil {
@@ -1541,7 +1544,161 @@ explicit choice, not a default.`,
 	cmd.Flags().BoolVar(&strict, "strict", false, "Exit non-zero when any series fails. By default a failed series warns and the run continues.")
 	cmd.Flags().IntVar(&maxConsecutiveFailures, "max-consecutive-failures", defaultMaxConsecutiveFailures,
 		"End the run when this many requests fail in a row. A whole run failing usually means the credential stopped being accepted or the service is refusing this client, not that these requests were unlucky.")
-	cmd.Flags().StringVar(&dbPath, "db", "", "Path to the local database. The default is resolved from this home's data directory, where the archive is named for the credential in use (data-<hash>.db) unless an unscoped data.db already exists there; pass --db to pin one file across credential rotations.")
+	cmd.Flags().StringVar(&dbPath, "db", "", "SQLite database file path. The default is this home's data directory data.db, which is named for the home rather than for the credential in use, so a token refresh never orphans it; pass --db to read or write a different file.")
 
 	return cmd
+}
+
+// ---------------------------------------------------------------------------
+// Archive path
+// ---------------------------------------------------------------------------
+
+// garminArchiveName is the one archive file name this tool's design names:
+// N131 §3, "SQLite archive at <data>/data.db".
+const garminArchiveName = "data.db"
+
+// garminScopedArchivePattern matches the token-scoped archive name the
+// generated resolver invents, `data-<sha256(auth header)[:12]>.db`.
+var garminScopedArchivePattern = regexp.MustCompile(
+	`^data-[0-9a-f]{` + strconv.Itoa(defaultDBScopeHashLen) + `}\.db$`)
+
+// garminArchivePath resolves the archive the novel commands read and write,
+// and it is deliberately not the generated resolver.
+//
+// The generated defaultDBPathInDir names the archive after a hash of the
+// current Authorization header, so a home's archive is scoped to the
+// credential in use. Garmin's DI chain rotates its refresh token on every
+// refresh and its access token roughly daily, so that name changes under a
+// daily sync and every rotation orphans the previous file: rows already walked
+// stop being visible and the next `history` re-walks years of history into a
+// new file. Nothing about a Garmin home needs that scoping — the design binds
+// one account to one home (N131 §2 Q3), so the home already is the isolation
+// boundary and the archive can carry the plain name §3 gives it.
+//
+// The fix has to survive the generated commands too, because `sync`,
+// `analytics` and `search` resolve through defaultDBPath and must not end up
+// on a different file from `history` and `insights`. That is why this resolver
+// does not merely return a different path: it makes the unscoped file exist.
+// The generated resolver prefers a scoped file when one is present and falls
+// through to an existing unscoped file otherwise, so once the scoped file is
+// gone and data.db is there, every generated command follows.
+//
+// dir comes from the generated resolver's own answer rather than from a second
+// call to cliutil.DataDir, so the pin lands in exactly the directory the
+// generated resolver reads, including on its fallback branches.
+func garminArchivePath(ctx context.Context, warn io.Writer) string {
+	generated := defaultDBPath("garmin-pp-cli")
+	dir := filepath.Dir(generated)
+	unscoped := filepath.Join(dir, garminArchiveName)
+
+	scoped := garminScopedArchives(dir)
+
+	if _, err := os.Stat(unscoped); err == nil {
+		if len(scoped) > 0 {
+			fmt.Fprintf(warn,
+				"warning: %s holds both %s and %d token-scoped archive(s) (%s).\n"+
+					"  history and insights use %s. The generated sync, analytics and search prefer the\n"+
+					"  scoped file, so they are writing a different archive: move or delete the scoped\n"+
+					"  file(s), or pass --db to pin one file explicitly.\n",
+				dir, garminArchiveName, len(scoped), strings.Join(scoped, ", "), garminArchiveName)
+		}
+		return unscoped
+	} else if !os.IsNotExist(err) {
+		// The directory is unreadable or something stranger; guessing here
+		// would be worse than deferring to the generated answer.
+		return generated
+	}
+
+	switch len(scoped) {
+	case 0:
+		if err := garminPinArchive(unscoped); err != nil {
+			fmt.Fprintf(warn, "warning: could not create %s (%v); using %s\n", unscoped, err, generated)
+			return generated
+		}
+	case 1:
+		if err := garminMigrateScopedArchive(ctx, filepath.Join(dir, scoped[0]), unscoped); err != nil {
+			fmt.Fprintf(warn, "warning: could not rename %s to %s (%v); using it where it is\n",
+				scoped[0], garminArchiveName, err)
+			return filepath.Join(dir, scoped[0])
+		}
+		fmt.Fprintf(warn,
+			"notice: renamed the token-scoped archive %s to %s in %s.\n"+
+				"  The archive is now named for this home, not for the credential, so a token refresh\n"+
+				"  no longer orphans it.\n",
+			scoped[0], garminArchiveName, dir)
+	default:
+		// Two or more scoped files means two credentials have already written
+		// separate archives here. Picking one would silently discard the
+		// other, so this starts a clean unscoped archive and names them all.
+		if err := garminPinArchive(unscoped); err != nil {
+			fmt.Fprintf(warn, "warning: could not create %s (%v); using %s\n", unscoped, err, generated)
+			return generated
+		}
+		fmt.Fprintf(warn,
+			"warning: %s holds %d token-scoped archives (%s) and no %s, so none of them could be\n"+
+				"  renamed without discarding the others. Started an empty %s; pass --db to read one of\n"+
+				"  the existing files instead.\n",
+			dir, len(scoped), strings.Join(scoped, ", "), garminArchiveName, garminArchiveName)
+	}
+	return unscoped
+}
+
+// garminScopedArchives lists the token-scoped archive names in dir, sorted.
+func garminScopedArchives(dir string) []string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var found []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if garminScopedArchivePattern.MatchString(e.Name()) {
+			found = append(found, e.Name())
+		}
+	}
+	sort.Strings(found)
+	return found
+}
+
+// garminPinArchive creates an empty archive file so the generated resolver's
+// "an unscoped archive exists" branch takes over for the generated commands
+// too. A zero-byte file is a valid empty SQLite database, so the first open
+// migrates it normally. Permissions match what the store enforces afterwards.
+func garminPinArchive(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	return f.Close()
+}
+
+// garminMigrateScopedArchive renames a token-scoped archive to the unscoped
+// name so its rows are not orphaned.
+//
+// Deviation from "one atomic rename": the store opens in WAL mode, so a
+// -wal/-shm pair can sit beside the archive, and renaming the main file alone
+// would strand the committed transactions in the stale WAL. Opening and
+// closing the store first checkpoints the WAL back into the main file, after
+// which the single rename carries everything. Any sidecar SQLite still leaves
+// behind is renamed alongside rather than deleted.
+func garminMigrateScopedArchive(ctx context.Context, scoped, unscoped string) error {
+	if _, err := os.Stat(scoped + "-wal"); err == nil {
+		if db, openErr := store.OpenWithContext(ctx, scoped); openErr == nil {
+			_ = db.Close()
+		}
+	}
+	if err := os.Rename(scoped, unscoped); err != nil {
+		return err
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, err := os.Stat(scoped + suffix); err == nil {
+			_ = os.Rename(scoped+suffix, unscoped+suffix)
+		}
+	}
+	return nil
 }

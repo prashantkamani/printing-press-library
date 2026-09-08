@@ -28,6 +28,7 @@ import (
 
 	"github.com/mvanhorn/printing-press-library/library/health/garmin/internal/cliutil"
 	"github.com/mvanhorn/printing-press-library/library/health/garmin/internal/config"
+	"github.com/spf13/cobra"
 )
 
 // ---------------------------------------------------------------------------
@@ -1328,4 +1329,275 @@ func TestAuthStatusJSONSeparatesAssertedEmailFromAnEnvCredential(t *testing.T) {
 			t.Fatal("a stored chain carried an unasserted-credential note")
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Login choreography: sign-out, sign-in page, then the confirmation (N131 §2
+// H1 / audit finding F13)
+// ---------------------------------------------------------------------------
+
+// loginRecorder captures the order of the three observable steps of a login —
+// the logout navigation, the sign-in navigation and the confirmation prompt —
+// so a test asserts the sequence rather than merely that each happened.
+type loginRecorder struct {
+	mu    sync.Mutex
+	steps []string
+	// onSignin runs while the sign-in navigation is being recorded, which is
+	// the only moment at which "the listener was already bound when the
+	// sign-in page opened" can be observed.
+	onSignin func(ssoURL string)
+}
+
+func (r *loginRecorder) add(step string) {
+	r.mu.Lock()
+	r.steps = append(r.steps, step)
+	r.mu.Unlock()
+}
+
+func (r *loginRecorder) seen() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.steps...)
+}
+
+// promptReader answers the confirmation prompt and records that it was asked.
+type promptReader struct {
+	rec    *loginRecorder
+	answer string
+	done   bool
+	// after runs once the prompt has been answered, which is how a test drives
+	// the callback that the y-path then waits for.
+	after func()
+}
+
+func (p *promptReader) Read(b []byte) (int, error) {
+	if p.done {
+		return 0, io.EOF
+	}
+	p.done = true
+	p.rec.add("prompt")
+	n := copy(b, p.answer)
+	if p.after != nil {
+		go p.after()
+	}
+	return n, nil
+}
+
+// newLoginHarness wires both seams and a scratch home, and returns the
+// recorder plus a runner. No browser is opened and no Garmin host is reached:
+// the only URLs anything touches are the loopback callback and, where a test
+// asks for one, an httptest server standing in for the token service.
+func newLoginHarness(t *testing.T, rec *loginRecorder, interactive bool, in io.Reader) func(garminLoginOptions) (error, string, string) {
+	t.Helper()
+	t.Setenv("GARMIN_HOME", t.TempDir())
+
+	prevOpen, prevInteractive := garminOpenURL, garminIsInteractive
+	t.Cleanup(func() { garminOpenURL, garminIsInteractive = prevOpen, prevInteractive })
+
+	garminIsInteractive = func(*cobra.Command) bool { return interactive }
+	garminOpenURL = func(raw string) error {
+		switch {
+		case strings.Contains(raw, "/sso/logout"):
+			rec.add("logout")
+		case strings.Contains(raw, "/sso/signin"):
+			rec.add("signin:" + raw)
+			if rec.onSignin != nil {
+				rec.onSignin(raw)
+			}
+		default:
+			rec.add("other:" + raw)
+		}
+		return nil
+	}
+
+	return func(opts garminLoginOptions) (error, string, string) {
+		cmd := &cobra.Command{}
+		var out, errBuf bytes.Buffer
+		cmd.SetOut(&out)
+		cmd.SetErr(&errBuf)
+		if in != nil {
+			cmd.SetIn(in)
+		}
+		cmd.SetContext(context.Background())
+		if opts.Domain == "" {
+			opts.Domain = garminDomainGlobal
+		}
+		if opts.Timeout == 0 {
+			opts.Timeout = 200 * time.Millisecond
+		}
+		err := runGarminLogin(cmd, &rootFlags{}, opts)
+		return err, out.String(), errBuf.String()
+	}
+}
+
+// serviceURLFrom pulls the loopback callback out of the sign-in URL. The
+// callback carries the state nonce, so this doubles as the nonce assertion.
+func serviceURLFrom(t *testing.T, ssoURL string) string {
+	t.Helper()
+	parsed, err := url.Parse(ssoURL)
+	if err != nil {
+		t.Fatalf("parse sso url %q: %v", ssoURL, err)
+	}
+	service := parsed.Query().Get("service")
+	if service == "" {
+		t.Fatalf("sign-in URL carries no service parameter: %q", ssoURL)
+	}
+	return service
+}
+
+// F13, the ordering itself. The confirmation must come after the sign-in page
+// is on screen — asked between the logout and the sign-in navigation it can
+// only confirm the logout page, and an SSO session that re-fills the form is
+// invisible at that point.
+func TestLoginAsksAboutTheFormOnlyAfterTheSignInPageIsOpen(t *testing.T) {
+	rec := &loginRecorder{}
+	var listenerAnswered int
+	rec.onSignin = func(ssoURL string) {
+		// The listener must already be bound when the sign-in page opens: a
+		// callback landing on a closed port shows an error page while Garmin
+		// has signed the user in. A ticket-less GET is the handler's 204 path.
+		service := serviceURLFrom(t, ssoURL)
+		resp, err := http.Get(service) //nolint:noctx // loopback probe in a test
+		if err != nil {
+			t.Errorf("callback listener was not bound when the sign-in page opened: %v", err)
+			return
+		}
+		defer resp.Body.Close() //nolint:errcheck // test
+		listenerAnswered = resp.StatusCode
+	}
+
+	run := newLoginHarness(t, rec, true, &promptReader{rec: rec, answer: "n\n"})
+	start := time.Now()
+	err, out, _ := run(garminLoginOptions{Email: "placeholder@example.test", Timeout: time.Hour})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("answering N still ran the login")
+	}
+	if !strings.Contains(err.Error(), "sso.garmin.com/sso/logout") {
+		t.Fatalf("the abort does not name the sign-out step: %v", err)
+	}
+	if elapsed > 30*time.Second {
+		t.Fatalf("answering N waited %s for a callback; it must abort immediately", elapsed)
+	}
+	if listenerAnswered != http.StatusNoContent {
+		t.Fatalf("callback probe status = %d, want 204", listenerAnswered)
+	}
+
+	steps := rec.seen()
+	if len(steps) != 3 {
+		t.Fatalf("steps = %v, want logout, signin, prompt", steps)
+	}
+	if steps[0] != "logout" || !strings.HasPrefix(steps[1], "signin:") || steps[2] != "prompt" {
+		t.Fatalf("login order = %v, want logout then signin then prompt", steps)
+	}
+	if !strings.Contains(out, "EMPTY sign-in form") {
+		t.Fatalf("stdout does not carry the confirmation prompt: %q", out)
+	}
+
+	// The nonce rides in the callback URL the sign-in page redirects to, and
+	// it must already be there when the page opens.
+	service := serviceURLFrom(t, strings.TrimPrefix(steps[1], "signin:"))
+	state := mustQueryParam(t, service, "state")
+	if len(state) != 32 {
+		t.Fatalf("callback state nonce = %q, want 32 hex characters", state)
+	}
+}
+
+func mustQueryParam(t *testing.T, raw, key string) string {
+	t.Helper()
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse %q: %v", raw, err)
+	}
+	return parsed.Query().Get(key)
+}
+
+// Functional: answering y proceeds to the callback wait, and the callback that
+// then arrives is exchanged. The token service is an httptest server reached
+// through GARMIN_TOKEN_URL, so the exchange is observed without a Garmin call.
+func TestLoginWaitsForTheCallbackAfterTheFormIsConfirmedEmpty(t *testing.T) {
+	var exchanges int
+	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		exchanges++
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
+	}))
+	defer tokenSrv.Close()
+	t.Setenv("GARMIN_TOKEN_URL", tokenSrv.URL)
+
+	rec := &loginRecorder{}
+	var signinURL string
+	rec.onSignin = func(raw string) { signinURL = raw }
+
+	prompt := &promptReader{rec: rec, answer: "y\n"}
+	prompt.after = func() {
+		// Stand in for the browser completing the sign-in.
+		service := serviceURLFrom(t, signinURL)
+		resp, err := http.Get(service + "&ticket=ST-synthetic-not-a-real-ticket") //nolint:noctx // loopback
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+	}
+
+	run := newLoginHarness(t, rec, true, prompt)
+	err, _, _ := run(garminLoginOptions{Email: "placeholder@example.test", Timeout: 10 * time.Second})
+
+	if err == nil {
+		t.Fatal("the synthetic exchange was expected to fail")
+	}
+	if strings.Contains(err.Error(), "did not come back within") {
+		t.Fatalf("the callback was never awaited after y: %v", err)
+	}
+	if exchanges != 1 {
+		t.Fatalf("token exchanges = %d, want 1", exchanges)
+	}
+	steps := rec.seen()
+	if len(steps) != 3 || steps[0] != "logout" || steps[2] != "prompt" {
+		t.Fatalf("login order = %v, want logout then signin then prompt", steps)
+	}
+}
+
+// Negative: with no person at the terminal — --agent sets --no-input, and a
+// piped session has no TTY — nothing is prompted and the flow still waits for
+// the callback. This is the path an agent runs.
+func TestLoginDoesNotPromptWithoutSomeoneToAnswer(t *testing.T) {
+	cases := []struct {
+		name        string
+		interactive bool
+		opts        garminLoginOptions
+		wantLogout  bool
+	}{
+		{name: "no tty", interactive: false, wantLogout: true},
+		{name: "no-logout skips both the sign-out and the prompt", interactive: true,
+			opts: garminLoginOptions{NoLogout: true}, wantLogout: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &loginRecorder{}
+			reader := &promptReader{rec: rec, answer: "n\n"}
+			run := newLoginHarness(t, rec, tc.interactive, reader)
+			opts := tc.opts
+			opts.Email = "placeholder@example.test"
+			opts.Timeout = 200 * time.Millisecond
+
+			err, out, _ := run(opts)
+			if err == nil || !strings.Contains(err.Error(), "did not come back within") {
+				t.Fatalf("error = %v, want the callback timeout (the flow must still wait)", err)
+			}
+			steps := rec.seen()
+			for _, s := range steps {
+				if s == "prompt" {
+					t.Fatalf("a prompt was issued with nobody to answer it: %v", steps)
+				}
+			}
+			gotLogout := len(steps) > 0 && steps[0] == "logout"
+			if gotLogout != tc.wantLogout {
+				t.Fatalf("logout navigation = %v, want %v (steps %v)", gotLogout, tc.wantLogout, steps)
+			}
+			if !strings.Contains(out, "already filled in with another account") {
+				t.Fatalf("the non-interactive advisory is missing: %q", out)
+			}
+		})
+	}
 }

@@ -73,6 +73,16 @@ func newNovelAuthLoginCmd(flags *rootFlags) *cobra.Command {
 	return cmd
 }
 
+// garminOpenURL is the browser-launch seam. It is a variable so the login
+// choreography — which page opens before which prompt — can be asserted in a
+// test without a browser. Production always holds openSetupURL.
+var garminOpenURL = openSetupURL
+
+// garminIsInteractive is the "is a person watching" seam. garminInteractive
+// insists on a real char-device stdin, which a test cannot supply, so the
+// prompt path would otherwise be untestable.
+var garminIsInteractive = garminInteractive
+
 type garminLoginOptions struct {
 	Email    string
 	Domain   string
@@ -108,7 +118,7 @@ func runGarminLogin(cmd *cobra.Command, flags *rootFlags, opts garminLoginOption
 	//    browser, so this has to be a browser navigation, not an HTTP call
 	//    from here: fetching the URL from Go would clear nothing.
 	if !opts.NoLogout {
-		if err := garminBrowserSignOut(cmd, flags, ep); err != nil {
+		if err := garminBrowserSignOut(cmd, ep); err != nil {
 			return authErr(err)
 		}
 	} else {
@@ -132,11 +142,20 @@ func runGarminLogin(cmd *cobra.Command, flags *rootFlags, opts garminLoginOption
 		return nil
 	}
 	fmt.Fprintf(out, "Opening Garmin's sign-in page for %s in your browser.\n", opts.Email)
-	if err := openSetupURL(ssoURL); err != nil {
+	if err := garminOpenURL(ssoURL); err != nil {
 		fmt.Fprintf(errOut, "could not open a browser automatically: %v\n", err)
 		fmt.Fprintf(out, "Open this URL yourself to continue:\n  %s\n", ssoURL)
 	}
-	fmt.Fprintf(out, "If the form is already filled in with another account, sign out at %s and run this again.\n", ep.SSOLogout)
+
+	// 2b. Only now can anyone see what the sign-out actually achieved. The
+	//     confirmation has to come after the sign-in page is on screen: asked
+	//     between the two navigations it can only confirm the logout page,
+	//     which says "Logged out!" whether or not Garmin then re-fills the
+	//     form from a surviving SSO session. That autofilled form is the exact
+	//     failure this prompt exists to catch (N131 §2 H1).
+	if err := garminConfirmEmptySignInForm(cmd, flags, opts, ep); err != nil {
+		return authErr(err)
+	}
 	fmt.Fprintf(out, "Waiting up to %s for the sign-in to come back.\n", opts.Timeout)
 
 	// 3. Wait for exactly one ticket. The listener stays open for the whole
@@ -238,27 +257,56 @@ func runGarminLogin(cmd *cobra.Command, flags *rootFlags, opts garminLoginOption
 // empty. The route was probed live on 2026-09-07: HTTP 200, body
 // "<p>Logged out!</p>". Neither reference client implements a logout at all,
 // so this is verified by probe rather than borrowed.
-func garminBrowserSignOut(cmd *cobra.Command, flags *rootFlags, ep garminEndpoints) error {
+func garminBrowserSignOut(cmd *cobra.Command, ep garminEndpoints) error {
 	out := cmd.OutOrStdout()
 	fmt.Fprintf(out, "Signing your browser out of Garmin first: %s\n", ep.SSOLogout)
 	if cliutil.IsVerifyEnv() {
 		fmt.Fprintf(out, "would launch: %s\n", ep.SSOLogout)
 		return nil
 	}
-	if err := openSetupURL(ep.SSOLogout); err != nil {
+	if err := garminOpenURL(ep.SSOLogout); err != nil {
 		fmt.Fprintf(cmd.ErrOrStderr(), "could not open a browser automatically: %v\n", err)
 		fmt.Fprintf(out, "Open this URL yourself to sign out:\n  %s\n", ep.SSOLogout)
 	}
-	if flags.noInput || flags.yes || !garminInteractive(cmd) {
-		fmt.Fprintln(out, "Confirm the page says you are signed out before the sign-in form appears; re-run with --no-logout to skip this step.")
+	return nil
+}
+
+// garminConfirmEmptySignInForm asks the person at the terminal whether the
+// sign-in page Garmin actually rendered is empty, and refuses to wait for a
+// callback when it is not.
+//
+// Ordering is the whole point. The sign-out navigation and the sign-in
+// navigation are two separate browser trips, and only the second one shows
+// whether the SSO session really went away: a surviving session re-fills the
+// form with the previous account, and submitting it signs in as that account
+// instead. The identity assertion still refuses to store that token, so the
+// cost of getting this wrong is a wasted round trip rather than a wrong
+// account — but the round trip includes a real Garmin login, which is exactly
+// what a household with two accounts should not have to repeat.
+//
+// The prompt is skipped in the three cases where nobody can answer it or
+// nothing was signed out: --no-logout, --no-input (which --agent sets) or
+// --yes, and a session with no terminal on both ends.
+func garminConfirmEmptySignInForm(cmd *cobra.Command, flags *rootFlags, opts garminLoginOptions, ep garminEndpoints) error {
+	out := cmd.OutOrStdout()
+	if opts.NoLogout || flags.noInput || flags.yes || !garminIsInteractive(cmd) {
+		fmt.Fprintf(out, "If the form is already filled in with another account, sign out at %s and run this again.\n", ep.SSOLogout)
 		return nil
 	}
-	fmt.Fprint(out, "Press Enter once the browser shows you are signed out (Ctrl-C to abort): ")
+	fmt.Fprintf(out, "Does the Garmin page show an EMPTY sign-in form? [y/N]: ")
 	reader := bufio.NewReader(cmd.InOrStdin())
-	if _, err := reader.ReadString('\n'); err != nil && !errors.Is(err, io.EOF) {
-		return fmt.Errorf("waiting for the sign-out confirmation: %w", err)
+	answer, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("waiting for the sign-in form confirmation: %w", err)
 	}
-	return nil
+	switch strings.ToLower(strings.TrimSpace(answer)) {
+	case "y", "yes":
+		return nil
+	}
+	return fmt.Errorf(
+		"the sign-in form is not empty, so Garmin still has a session for another account. Nothing was stored.\n"+
+			"  Sign out at %s in your browser, close the sign-in tab, then run this command again",
+		ep.SSOLogout)
 }
 
 // garminInteractive reports whether a person is at the terminal to answer the
