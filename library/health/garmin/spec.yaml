@@ -147,8 +147,9 @@ paths:
       summary: List server-aggregated daily sleep summaries for a date range
       description: |
         One row per night between `start` and `end`, aggregated by Garmin. At most 28 calendar days per
-        request; longer ranges are walked in 28-day windows by `sync` and de-duplicated on the calendar
-        date. Rows arrive under `individualStats`.
+        request; `history` walks longer ranges backwards in 28-day windows into the local archive and
+        de-duplicates on the calendar date. The generated `sync` verb does not chunk this series. Rows
+        arrive under `individualStats`.
       parameters:
         - $ref: '#/components/parameters/DIBackend'
         - $ref: '#/components/parameters/StartDate'
@@ -583,7 +584,8 @@ paths:
       summary: List daily step totals and goals for a date range
       description: |
         One row per calendar date with total steps, the step goal and the distance walked. At most 28
-        calendar days per request; `sync` walks longer ranges in windows.
+        calendar days per request; `history` walks longer ranges in 28-day windows into the local
+        archive. The generated `sync` verb does not chunk this series.
       parameters:
         - $ref: '#/components/parameters/DIBackend'
         - $ref: '#/components/parameters/StartDate'

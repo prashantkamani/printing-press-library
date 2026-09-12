@@ -1193,3 +1193,130 @@ func TestArchivePathIgnoresFilesThatAreNotScopedArchives(t *testing.T) {
 		t.Fatalf("the decoy triggered a warning: %q", warn.String())
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Refused windows at the history edge
+// ---------------------------------------------------------------------------
+
+// Garmin answers HTTP 403 to a date range that reaches past the start of the
+// account's history. Observed live on 2026-09-12: `history --backfill` exited
+// 5 because the first backward window of intensity_minutes was refused and ten
+// refusals in a row across the ranged series read as a dead credential, so the
+// run stopped before activities and the per-day series were attempted. In the
+// backward leg a refusal is the account's history start, so it counts as an
+// empty window and never counts toward the wall.
+func TestWalkWindowed_BackfillTreatsARefusedWindowAsTheHistoryStart(t *testing.T) {
+	db := testStore(t)
+	// Garmin serves windows from 2026-06-17 onward and refuses everything
+	// older, the way it does for a range past the account's first data.
+	cutoff := mustParseCivilDay("2026-06-17")
+	api := &fakeGarmin{respond: func(c fakeCall, _ int) (json.RawMessage, error) {
+		if strings.HasPrefix(c.path, "/sleep-service/stats/sleep/daily/") {
+			return json.RawMessage(`{"individualStats":[]}`), nil
+		}
+		start := mustParseCivilDay(strings.Split(strings.TrimPrefix(c.path, "/usersummary-service/stats/steps/daily/"), "/")[0])
+		if start.before(cutoff) {
+			return nil, fmt.Errorf("GET %s returned HTTP 403: {\"error\":\"ForbiddenException\"}", c.path)
+		}
+		return stepsWindowPayload(c.path), nil
+	}}
+	var buf strings.Builder
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{
+		days: 28, backfill: true, emptyWindowCeiling: 3, now: fixedClock("2026-09-08"),
+	})
+	w.emit = &garminEmitter{w: &buf, machine: true}
+
+	out := w.walkSeries(context.Background(), seriesNamed(t, "steps"))
+	if out.errored {
+		t.Fatalf("a refused window must not error the series: %v", out.err)
+	}
+	if !out.warned {
+		t.Fatal("a walk that stopped because Garmin refused the next window must say so")
+	}
+	if w.consecutiveFailures != 0 {
+		t.Fatalf("consecutive_failures = %d; a refusal at the history edge must not count toward the wall", w.consecutiveFailures)
+	}
+
+	st, _ := db.GetGarminSeriesState("steps")
+	if st.StopReason != "window_denied_stop" {
+		t.Fatalf("stop_reason = %q, want window_denied_stop", st.StopReason)
+	}
+	if st.EmptyWindows != 3 {
+		t.Fatalf("empty_windows = %d, want exactly the ceiling of 3", st.EmptyWindows)
+	}
+	if st.EarliestDay != "2026-06-17" {
+		t.Fatalf("earliest_day = %q, want 2026-06-17: the start of the oldest window Garmin served", st.EarliestDay)
+	}
+
+	denials := strings.Count(buf.String(), `"reason":"window_denied_stop"`)
+	if denials != 1 {
+		t.Fatalf("emitted %d window_denied_stop warnings, want exactly 1:\n%s", denials, buf.String())
+	}
+	if !strings.Contains(buf.String(), "2026-06-17..2026-07-14") {
+		t.Fatalf("the warning does not name the earliest window that was served:\n%s", buf.String())
+	}
+	if strings.Contains(buf.String(), "window_fetch_failed") {
+		t.Fatalf("a refused window was reported as a fetch failure:\n%s", buf.String())
+	}
+
+	// The blast radius is the point: the next series still runs on the same
+	// walker, which before the fix it did not — the wall ended the whole run.
+	sleepOut := w.walkSeries(context.Background(), seriesNamed(t, "sleep_stats"))
+	if sleepOut.errored {
+		t.Fatalf("the series after the refused one did not run: %v", sleepOut.err)
+	}
+	if len(api.pathsMatching("/sleep-service/stats/sleep/daily/")) == 0 {
+		t.Fatal("no request was made for the series after the refused one")
+	}
+}
+
+// A 403 in the forward leg is a different fact: those windows are inside the
+// account's lifetime, so a refusal there is a fault and still counts toward
+// the wall that ends a run against a dead credential.
+func TestWalkWindowed_ForwardLegStillCountsA403AsAFailure(t *testing.T) {
+	db := testStore(t)
+	api := &fakeGarmin{respond: func(c fakeCall, _ int) (json.RawMessage, error) {
+		return nil, fmt.Errorf("GET %s returned HTTP 403: {\"error\":\"ForbiddenException\"}", c.path)
+	}}
+	var buf strings.Builder
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{
+		days: 28, maxConsecutiveFailures: 10, now: fixedClock("2026-09-08"),
+	})
+	w.emit = &garminEmitter{w: &buf, machine: true}
+
+	out := w.walkSeries(context.Background(), seriesNamed(t, "steps"))
+	if out.errored {
+		t.Fatalf("one refused forward window must warn, not end the run: %v", out.err)
+	}
+	if !out.warned {
+		t.Fatal("a refused forward window must warn")
+	}
+	if w.consecutiveFailures != 1 {
+		t.Fatalf("consecutive_failures = %d, want 1: a forward-leg 403 still counts toward the wall", w.consecutiveFailures)
+	}
+	if !strings.Contains(buf.String(), `"reason":"window_fetch_failed"`) {
+		t.Fatalf("the forward failure was not reported:\n%s", buf.String())
+	}
+	if strings.Contains(buf.String(), "window_denied_stop") {
+		t.Fatalf("a forward-leg 403 was excused as a history edge:\n%s", buf.String())
+	}
+}
+
+func TestIsForbidden_MatchesTheStatusTheClientPrints(t *testing.T) {
+	cases := map[string]bool{
+		"GET /usersummary-service/stats/im/weekly/2025-08-17/2026-08-15 returned HTTP 403": true,
+		"GET /x returned HTTP 403: {\"error\":\"ForbiddenException\"}":                     true,
+		"GET /x returned HTTP 401": false,
+		"GET /x returned HTTP 429": false,
+		"":                         false,
+	}
+	for msg, want := range cases {
+		var err error
+		if msg != "" {
+			err = errors.New(msg)
+		}
+		if got := isForbidden(err); got != want {
+			t.Fatalf("isForbidden(%q) = %v, want %v", msg, got, want)
+		}
+	}
+}

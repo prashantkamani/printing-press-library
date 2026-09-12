@@ -28,7 +28,7 @@ type whichEntry struct {
 // query to one of the commands the skill says matter most.
 var whichIndex = []whichEntry{
 	{Command: "auth login", Description: "Signs in through Garmin's own page in your browser, catches the redirect on a loopback port, and refuses to store a token whose account email does not match the one you named.", Group: "Auth you can trust with a household", WhyItMatters: "Use this once per Garmin account per home; after it, everything else works unattended from the refresh token."},
-	{Command: "history", Description: "Walks every daily-stats series backwards in 28-day windows into a local SQLite archive and resumes where it stopped.", Group: "Local state that compounds", WhyItMatters: "Run this before any trend question; every analytics command reads the archive, not the API."},
+	{Command: "history", Description: "Walks the date-ranged daily-stats series backwards into a local SQLite archive and resumes where it stopped — 28-day windows where Garmin caps a request at 28 days, 364-day windows where it does not, and one request per day for the per-day series.", Group: "Local state that compounds", WhyItMatters: "Run this before any trend question; every analytics command reads the archive, not the API."},
 }
 
 // whichMatch pairs an index entry with its ranking score for a query.

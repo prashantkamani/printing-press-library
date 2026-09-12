@@ -186,9 +186,16 @@ func newGarminAuthStatusCmd(flags *rootFlags) *cobra.Command {
 			var verifyErr error
 			if verify && authed {
 				verified, verifyErr = garminVerifyStored(cmd.Context(), cfg, identity, cmd.ErrOrStderr())
-				if verified {
-					identity, _ = garminLoadIdentity(cfg.Path)
+				// Verifying can rotate the chain: garminVerifyStored runs the
+				// pre-call refresh, which writes a new access token into cfg
+				// and a fresh refresh_expiry into the sidecar. Both have to be
+				// re-read or the command reports the chain it just replaced.
+				// Re-read even when the verify failed: the refresh can succeed
+				// and the identity call that follows it fail.
+				if reloaded, loadErr := garminLoadIdentity(cfg.Path); loadErr == nil && reloaded != nil {
+					identity = reloaded
 				}
+				stored = garminStoredTokens(cfg)
 			}
 
 			needsRefresh := false
@@ -367,33 +374,59 @@ func garminVerifyStored(ctx context.Context, cfg *config.Config, identity *garmi
 	if email == "" {
 		return false, errors.New("Garmin's identity response carried no account email")
 	}
-	next := &garminIdentity{Domain: ep.Domain, ClientID: stored.ClientID}
-	if identity != nil {
-		next = identity
-	}
-	if next.Email != "" && !strings.EqualFold(next.Email, email) {
+	// The mismatch check reads the identity this function was handed, which is
+	// correct here: a refresh only ever rewrites refresh_expiry in the sidecar
+	// (garminPersistTokens), never the account it records.
+	if identity != nil && identity.Email != "" && !strings.EqualFold(identity.Email, email) {
 		return false, fmt.Errorf(
 			"this home records %s but the stored token authenticates %s; run `garmin-pp-cli auth logout` then sign in again",
-			next.Email, email)
+			identity.Email, email)
 	}
-	next.Email = email
-	next.Domain = ep.Domain
-	if guid := garminJWTString(stored.AccessToken, "garmin_guid"); guid != "" {
-		next.GarminGUID = guid
-	}
-	if stored.ClientID != "" {
-		next.ClientID = stored.ClientID
-	}
-	if next.ProfileID == "" {
+
+	// The profile read is a second network call and stays outside the auth
+	// lock: holding the lock across a Garmin round trip (plus the pacing
+	// sleep) would stall a concurrent refresh for no reason.
+	profileID, displayName := "", ""
+	if identity == nil || identity.ProfileID == "" {
 		time.Sleep(300 * time.Millisecond)
 		var social garminSocialProfile
 		if err := garminGetJSON(callCtx, hc, ep, stored.AccessToken, garminSocialProfilePath, &social); err == nil {
-			next.ProfileID = social.ProfileID.String()
-			next.DisplayName = social.DisplayName
+			profileID = social.ProfileID.String()
+			displayName = social.DisplayName
 		}
 	}
-	next.AssertedAt = time.Now().UTC()
-	if err := garminWithAuthLock(cfg.Path, func() error { return garminSaveIdentity(cfg.Path, next) }); err != nil {
+
+	err := garminWithAuthLock(cfg.Path, func() error {
+		// Re-read the sidecar under the lock rather than editing the copy
+		// this function was handed. garminEnsureFreshToken above may have
+		// refreshed the chain, and a refresh writes a fresh 30-day
+		// refresh_expiry into that same file; the caller's copy predates the
+		// write, so saving it would revert refresh_expiry to the login-time
+		// value and "Refresh until" would never move.
+		next, loadErr := garminLoadIdentity(cfg.Path)
+		if loadErr != nil || next == nil {
+			next = &garminIdentity{Domain: ep.Domain, ClientID: stored.ClientID}
+			if identity != nil {
+				clone := *identity
+				next = &clone
+			}
+		}
+		next.Email = email
+		next.Domain = ep.Domain
+		if guid := garminJWTString(stored.AccessToken, "garmin_guid"); guid != "" {
+			next.GarminGUID = guid
+		}
+		if stored.ClientID != "" {
+			next.ClientID = stored.ClientID
+		}
+		if next.ProfileID == "" && profileID != "" {
+			next.ProfileID = profileID
+			next.DisplayName = displayName
+		}
+		next.AssertedAt = time.Now().UTC()
+		return garminSaveIdentity(cfg.Path, next)
+	})
+	if err != nil {
 		return false, err
 	}
 	return true, nil

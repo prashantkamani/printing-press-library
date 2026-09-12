@@ -3,6 +3,10 @@
 // the printing-press novel-command scaffold; `generate --force` preserves an
 // implemented body. Shared auth machinery lives in garmin_auth.go.
 // pp:data-source live
+// pp:client-call — the ticket exchange and the identity assertion call
+// Garmin's own token and Connect endpoints through garminHTTPClient rather
+// than through the generated internal/client, so the string heuristics cannot
+// see the call. garminExchangeServiceTicket (garmin_auth.go) is the call.
 
 package cli
 
@@ -153,34 +157,57 @@ func runGarminLogin(cmd *cobra.Command, flags *rootFlags, opts garminLoginOption
 	//     which says "Logged out!" whether or not Garmin then re-fills the
 	//     form from a surviving SSO session. That autofilled form is the exact
 	//     failure this prompt exists to catch (N131 §2 H1).
-	if err := garminConfirmEmptySignInForm(cmd, flags, opts, ep); err != nil {
-		return authErr(err)
-	}
-	fmt.Fprintf(out, "Waiting up to %s for the sign-in to come back.\n", opts.Timeout)
-
-	// 3. Wait for exactly one ticket. The listener stays open for the whole
-	//    deadline: a callback that arrives at a closed port shows the browser
-	//    an error page even though Garmin has signed the user in.
+	//
+	//     The deadline starts here rather than after the confirmation. The
+	//     prompt is answered by a person, so it can be left outstanding
+	//     indefinitely; bounding it with the same --timeout means someone who
+	//     neither answers nor signs in gets the timeout error instead of a
+	//     terminal that waits forever.
+	//
+	//     This deadline covers the two steps a person is inside — the
+	//     confirmation prompt and the wait for the sign-in to come back — and
+	//     nothing after them. Step 4 opens its own budget, so answering `y`
+	//     one second before --timeout expires still leaves the ticket
+	//     exchange a full HTTP timeout to spend.
 	ctx, cancel := context.WithTimeout(cmd.Context(), opts.Timeout)
 	defer cancel()
-	var ticket string
-	select {
-	case ticket = <-cb.Ticket():
-	case <-ctx.Done():
-		return authErr(garminLoginTimeoutError(opts.Timeout, cb.Rejected()))
+	ticket, err := garminConfirmEmptySignInForm(ctx, cmd, flags, opts, ep, cb)
+	if err != nil {
+		return authErr(err)
+	}
+
+	// 3. Wait for exactly one ticket, unless the sign-in already came back
+	//    while the confirmation was outstanding. The listener stays open for
+	//    the whole deadline: a callback that arrives at a closed port shows
+	//    the browser an error page even though Garmin has signed the user in.
+	if ticket == "" {
+		fmt.Fprintf(out, "Waiting up to %s for the sign-in to come back.\n", opts.Timeout)
+		select {
+		case ticket = <-cb.Ticket():
+		case <-ctx.Done():
+			return authErr(garminLoginTimeoutError(opts.Timeout, cb.Rejected()))
+		}
 	}
 	_ = cb.Close()
+
+	// The person is done; everything below is machine-to-machine and gets its
+	// own budget. Sharing the --timeout deadline would hand the single-use
+	// ticket exchange whatever a slow answer left of it, which for an answer
+	// near the default 10 minutes is close to nothing — and the failure would
+	// surface as a raw context deadline rather than anything actionable.
+	exchangeCtx, exchangeCancel := context.WithTimeout(cmd.Context(), garminHTTPTimeout)
+	defer exchangeCancel()
 
 	// 4. Exchange the single-use ticket. One attempt only: a failed exchange
 	//    burns the ticket, so retrying would fail for a second reason.
 	hc := garminHTTPClient()
-	tokens, err := garminExchangeServiceTicket(ctx, hc, ep, ticket, cb.URL)
+	tokens, err := garminExchangeServiceTicket(exchangeCtx, hc, ep, ticket, cb.URL)
 	if err != nil {
 		return authErr(err)
 	}
 
 	// 5. Assert the identity before anything is written.
-	assertedEmail, err := garminAssertEmail(ctx, hc, ep, tokens.AccessToken, opts.Email)
+	assertedEmail, err := garminAssertEmail(exchangeCtx, hc, ep, tokens.AccessToken, opts.Email)
 	if err != nil {
 		if errors.Is(err, errGarminIdentityMismatch) {
 			return authErr(fmt.Errorf(
@@ -203,7 +230,7 @@ func runGarminLogin(cmd *cobra.Command, flags *rootFlags, opts garminLoginOption
 	profileID, displayName := "", ""
 	time.Sleep(300 * time.Millisecond)
 	var social garminSocialProfile
-	if err := garminGetJSON(ctx, hc, ep, tokens.AccessToken, garminSocialProfilePath, &social); err == nil {
+	if err := garminGetJSON(exchangeCtx, hc, ep, tokens.AccessToken, garminSocialProfilePath, &social); err == nil {
 		profileID = social.ProfileID.String()
 		displayName = social.DisplayName
 	}
@@ -287,26 +314,72 @@ func garminBrowserSignOut(cmd *cobra.Command, ep garminEndpoints) error {
 // The prompt is skipped in the three cases where nobody can answer it or
 // nothing was signed out: --no-logout, --no-input (which --agent sets) or
 // --yes, and a session with no terminal on both ends.
-func garminConfirmEmptySignInForm(cmd *cobra.Command, flags *rootFlags, opts garminLoginOptions, ep garminEndpoints) error {
+//
+// The question is never allowed to outlive its own premise. The browser can
+// complete the sign-in before anyone types, and by then the answer is moot:
+// the form that mattered is gone from the screen and the ticket Garmin just
+// issued is single-use and short-lived, so blocking on stdin only ages it out
+// (observed 2026-09-12: a login sat at this prompt for ten minutes and the
+// ticket expired). A ticket arriving on cb therefore wins the race, and ctx —
+// the login's own --timeout — bounds the wait when neither happens.
+//
+// The returned string is the ticket that arrived early, or "" when the caller
+// still has to wait for one. Empty is an unambiguous sentinel: the callback
+// handler answers a ticket-less request with 204 and never pushes an empty
+// string onto the channel (garminCallback.handle in garmin_auth.go).
+func garminConfirmEmptySignInForm(ctx context.Context, cmd *cobra.Command, flags *rootFlags, opts garminLoginOptions, ep garminEndpoints, cb *garminCallback) (string, error) {
 	out := cmd.OutOrStdout()
 	if opts.NoLogout || flags.noInput || flags.yes || !garminIsInteractive(cmd) {
 		fmt.Fprintf(out, "If the form is already filled in with another account, sign out at %s and run this again.\n", ep.SSOLogout)
-		return nil
+		return "", nil
 	}
 	fmt.Fprintf(out, "Does the Garmin page show an EMPTY sign-in form? [y/N]: ")
-	reader := bufio.NewReader(cmd.InOrStdin())
-	answer, err := reader.ReadString('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
-		return fmt.Errorf("waiting for the sign-in form confirmation: %w", err)
+
+	type garminFormAnswer struct {
+		line string
+		err  error
 	}
-	switch strings.ToLower(strings.TrimSpace(answer)) {
-	case "y", "yes":
-		return nil
+	// The read moves off the main path so the ticket can win. When nobody
+	// answers, this goroutine stays blocked on stdin for the life of the
+	// process — deliberate, and free: the CLI exits as soon as the login
+	// returns, and there is no portable way to interrupt a pending terminal
+	// read. The channel is buffered so the send never blocks either.
+	answers := make(chan garminFormAnswer, 1)
+	go func() {
+		line, err := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
+		answers <- garminFormAnswer{line: line, err: err}
+	}()
+
+	continuing := func(ticket string) (string, error) {
+		fmt.Fprintln(out, "Sign-in came back before the form check; continuing.")
+		return ticket, nil
 	}
-	return fmt.Errorf(
-		"the sign-in form is not empty, so Garmin still has a session for another account. Nothing was stored.\n"+
-			"  Sign out at %s in your browser, close the sign-in tab, then run this command again",
-		ep.SSOLogout)
+	select {
+	case ticket := <-cb.Ticket():
+		return continuing(ticket)
+	case got := <-answers:
+		// select picks pseudorandomly when both are ready, so a ticket that
+		// landed while the answer was in flight is re-checked here: signing
+		// in is the act, typing is the commentary, and the act wins.
+		select {
+		case ticket := <-cb.Ticket():
+			return continuing(ticket)
+		default:
+		}
+		if got.err != nil && !errors.Is(got.err, io.EOF) {
+			return "", fmt.Errorf("waiting for the sign-in form confirmation: %w", got.err)
+		}
+		switch strings.ToLower(strings.TrimSpace(got.line)) {
+		case "y", "yes":
+			return "", nil
+		}
+		return "", fmt.Errorf(
+			"the sign-in form is not empty, so Garmin still has a session for another account. Nothing was stored.\n"+
+				"  Sign out at %s in your browser, close the sign-in tab, then run this command again",
+			ep.SSOLogout)
+	case <-ctx.Done():
+		return "", garminLoginTimeoutError(opts.Timeout, cb.Rejected())
+	}
 }
 
 // garminInteractive reports whether a person is at the terminal to answer the

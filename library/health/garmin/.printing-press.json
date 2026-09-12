@@ -42,5 +42,17 @@
       "sensitive": true
     }
   ],
-  "auth_key_url": "https://sso.garmin.com/portal/sso/en-US/sign-in"
+  "auth_key_url": "https://sso.garmin.com/portal/sso/en-US/sign-in",
+  "novel_features": [
+    {
+      "name": "Loopback browser login with identity assertion",
+      "command": "auth login",
+      "description": "Signs in through Garmin's own page in your browser, catches the redirect on a loopback port, and refuses to store a token whose account email does not match the one you named."
+    },
+    {
+      "name": "Windowed backfill of the 28-day-capped series",
+      "command": "history",
+      "description": "Walks the date-ranged daily-stats series backwards into a local SQLite archive and resumes where it stopped — 28-day windows where Garmin caps a request at 28 days, 364-day windows where it does not, and one request per day for the per-day series."
+    }
+  ]
 }

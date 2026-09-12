@@ -1601,3 +1601,294 @@ func TestLoginDoesNotPromptWithoutSomeoneToAnswer(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// auth status --verify reports the chain it verified, not the one it replaced
+// ---------------------------------------------------------------------------
+
+// --verify runs the pre-call refresh before it asks Garmin who the token
+// belongs to. Two things then have to survive that refresh: the expiry lines
+// have to describe the new access token rather than the expired one the
+// command loaded, and the fresh refresh_expiry the refresh wrote into the
+// sidecar must not be reverted by saving an identity object read before it.
+// Symptom of the second one, seen 2026-09-11: "Refresh until" never moved
+// although every refresh response carries refresh_token_expires_in 2591999.
+// garminVerifyFixture is one home whose stored access token has already
+// expired and whose refresh endpoint answers with a rotated refresh token and
+// a fresh 30-day window — the shape probed live on 2026-09-07. Two paths
+// through `auth status --verify` share it: the one where the account check
+// after the refresh succeeds, and the one where it fails.
+type garminVerifyFixture struct {
+	configPath         string
+	apiURL             string
+	refreshedAccess    string
+	loginRefreshExpiry time.Time
+	refreshes          int
+	identityCalls      int
+	bearerSeen         string
+}
+
+// newGarminVerifyFixture stands the home up. identityOK chooses whether the
+// personal-information call that follows the refresh answers or fails; the
+// refresh itself lands on disk either way, which is the whole point of the
+// failing variant.
+func newGarminVerifyFixture(t *testing.T, identityOK bool) *garminVerifyFixture {
+	t.Helper()
+	f := &garminVerifyFixture{}
+
+	home := t.TempDir()
+	t.Setenv("GARMIN_HOME", home)
+	configDir := filepath.Join(home, "config")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatalf("make config dir: %v", err)
+	}
+	f.configPath = filepath.Join(configDir, "config.toml")
+
+	const guid = "11111111-2222-3333-4444-555555555555"
+	f.refreshedAccess = fakeJWT(t, map[string]any{
+		"client_id":   "GARMIN_TEST_CLIENT",
+		"garmin_guid": guid,
+		"exp":         time.Now().Add(20 * time.Hour).Unix(),
+	})
+	expiredAccess := fakeJWT(t, map[string]any{
+		"client_id":   "GARMIN_TEST_CLIENT",
+		"garmin_guid": guid,
+		"exp":         time.Now().Add(-time.Hour).Unix(),
+	})
+
+	// Stand-in for diauth: one refresh, rotated refresh token, a fresh 30-day
+	// refresh window.
+	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		f.refreshes++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"token_type":"Bearer","access_token":"` + f.refreshedAccess +
+			`","refresh_token":"rotated-refresh-fixture","expires_in":72000,"refresh_token_expires_in":2591999}`))
+	}))
+	t.Cleanup(tokenSrv.Close)
+	t.Setenv("GARMIN_TOKEN_URL", tokenSrv.URL+"/di-oauth2-service/oauth/token")
+
+	// Stand-in for the Connect API: the account check only.
+	apiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, garminPersonalInformationPath) {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		f.identityCalls++
+		f.bearerSeen = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !identityOK {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":"upstream unavailable"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"userInfo":{"email":"placeholder@example.test"}}`))
+	}))
+	t.Cleanup(apiSrv.Close)
+	f.apiURL = apiSrv.URL
+	if err := os.WriteFile(f.configPath, []byte("base_url = '"+apiSrv.URL+"'\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load("")
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if err := cfg.SaveTokens("GARMIN_TEST_CLIENT", "", expiredAccess, "original-refresh-fixture", time.Now().Add(-time.Hour)); err != nil {
+		t.Fatalf("save tokens: %v", err)
+	}
+
+	// The login-time refresh window: what a stale identity object would put
+	// back on disk.
+	f.loginRefreshExpiry = time.Now().Add(48 * time.Hour).UTC().Truncate(time.Second)
+	if err := garminSaveIdentity(f.configPath, &garminIdentity{
+		Email:         "placeholder@example.test",
+		GarminGUID:    guid,
+		ProfileID:     "9999999",
+		Domain:        garminDomainGlobal,
+		ClientID:      "GARMIN_TEST_CLIENT",
+		RefreshExpiry: f.loginRefreshExpiry,
+	}); err != nil {
+		t.Fatalf("save identity: %v", err)
+	}
+	return f
+}
+
+func TestAuthStatusVerifyReportsThePostRefreshChain(t *testing.T) {
+	f := newGarminVerifyFixture(t, true)
+	configPath := f.configPath
+
+	cfg, err := config.Load("")
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.Path != configPath {
+		t.Fatalf("config path = %q, want %q", cfg.Path, configPath)
+	}
+	if got := garminEndpointsFor(cfg, garminDomainGlobal).ConnectAPI; got != f.apiURL {
+		t.Fatalf("ConnectAPI = %q, want the loopback stand-in %q", got, f.apiURL)
+	}
+
+	before := time.Now()
+	flags := &rootFlags{asJSON: true}
+	cmd := newGarminAuthStatusCmd(flags)
+	var out, errBuf bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errBuf)
+	cmd.SetArgs([]string{"--verify"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("auth status --verify --json: %v (stderr %q)", err, errBuf.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("decode %q: %v", out.String(), err)
+	}
+
+	if f.refreshes != 1 || f.identityCalls != 1 {
+		t.Fatalf("refreshes = %d, identity calls = %d, want 1 and 1", f.refreshes, f.identityCalls)
+	}
+	if f.bearerSeen != f.refreshedAccess {
+		t.Fatal("the account check presented a token other than the refreshed one")
+	}
+	if got["verified"] != true {
+		t.Fatalf("verified = %v, want true (stderr %q)", got["verified"], errBuf.String())
+	}
+	if got["needs_refresh"] != false {
+		t.Fatalf("needs_refresh = %v, want false: the chain was just refreshed", got["needs_refresh"])
+	}
+
+	// The access token the command reports must be the one it now holds.
+	wantTokenExpiry := garminFormatTime(garminJWTExpiry(f.refreshedAccess))
+	if got["token_expiry"] != wantTokenExpiry {
+		t.Fatalf("token_expiry = %v, want the post-refresh expiry %v", got["token_expiry"], wantTokenExpiry)
+	}
+
+	// refresh_token_expires_in 2591999 is ~30 days, so the reported window has
+	// to be far past the 48-hour login-time value, not equal to it.
+	reported, ok := got["refresh_expiry"].(string)
+	if !ok {
+		t.Fatalf("refresh_expiry = %v, want a timestamp", got["refresh_expiry"])
+	}
+	if reported == garminFormatTime(f.loginRefreshExpiry) {
+		t.Fatal("refresh_expiry is still the login-time value; the refreshed window was reverted")
+	}
+	reportedAt, err := time.Parse(time.RFC3339, reported)
+	if err != nil {
+		t.Fatalf("parse refresh_expiry %q: %v", reported, err)
+	}
+	wantAtLeast := before.Add(29 * 24 * time.Hour)
+	if reportedAt.Before(wantAtLeast) {
+		t.Fatalf("refresh_expiry = %s, want at least %s (a fresh 30-day window)", reported, wantAtLeast.UTC().Format(time.RFC3339))
+	}
+
+	// And the sidecar on disk has to agree: the next command reads that file,
+	// not this command's output.
+	onDisk, err := garminLoadIdentity(configPath)
+	if err != nil {
+		t.Fatalf("reload identity: %v", err)
+	}
+	if garminFormatTime(onDisk.RefreshExpiry) != reported {
+		t.Fatalf("sidecar refresh_expiry = %s, reported %s", garminFormatTime(onDisk.RefreshExpiry), reported)
+	}
+	if onDisk.Email != "placeholder@example.test" || onDisk.ProfileID != "9999999" {
+		t.Fatalf("verify lost the recorded account details: %+v", onDisk)
+	}
+	if onDisk.AssertedAt.Before(before) {
+		t.Fatal("verify did not re-stamp asserted_at")
+	}
+}
+
+// The refresh and the account check are two calls, and only the first one
+// writes. When the identity call fails after a successful refresh, the
+// command's own output has to describe the chain now on disk — the fresh
+// 30-day window and an access token that no longer needs refreshing — while
+// still reporting that nothing about the account was confirmed. Reporting the
+// pre-refresh values here is the reported symptom ("Refresh until does not
+// move") surviving on the error path.
+func TestAuthStatusVerifyReportsTheRefreshedChainWhenTheAccountCheckFails(t *testing.T) {
+	f := newGarminVerifyFixture(t, false)
+
+	before := time.Now()
+	flags := &rootFlags{asJSON: true}
+	cmd := newGarminAuthStatusCmd(flags)
+	var out, errBuf bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errBuf)
+	cmd.SetArgs([]string{"--verify"})
+	cmd.SilenceUsage, cmd.SilenceErrors = true, true
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("a failed account check must still exit non-zero")
+	}
+
+	var got map[string]any
+	if jsonErr := json.Unmarshal(out.Bytes(), &got); jsonErr != nil {
+		t.Fatalf("decode %q: %v", out.String(), jsonErr)
+	}
+	if f.refreshes != 1 || f.identityCalls != 1 {
+		t.Fatalf("refreshes = %d, identity calls = %d, want 1 and 1", f.refreshes, f.identityCalls)
+	}
+	if got["verified"] != false {
+		t.Fatalf("verified = %v, want false: Garmin never confirmed the account", got["verified"])
+	}
+	if msg, _ := got["verify_error"].(string); strings.TrimSpace(msg) == "" {
+		t.Fatalf("verify_error = %v, want the failure named", got["verify_error"])
+	}
+	if got["needs_refresh"] != false {
+		t.Fatalf("needs_refresh = %v, want false: the refresh itself succeeded", got["needs_refresh"])
+	}
+
+	reported, ok := got["refresh_expiry"].(string)
+	if !ok {
+		t.Fatalf("refresh_expiry = %v, want a timestamp", got["refresh_expiry"])
+	}
+	if reported == garminFormatTime(f.loginRefreshExpiry) {
+		t.Fatal("refresh_expiry is the login-time value; the refreshed window was written to disk and then not read back")
+	}
+	reportedAt, parseErr := time.Parse(time.RFC3339, reported)
+	if parseErr != nil {
+		t.Fatalf("parse refresh_expiry %q: %v", reported, parseErr)
+	}
+	if wantAtLeast := before.Add(29 * 24 * time.Hour); reportedAt.Before(wantAtLeast) {
+		t.Fatalf("refresh_expiry = %s, want at least %s (the fresh 30-day window)", reported, wantAtLeast.UTC().Format(time.RFC3339))
+	}
+
+	// The sidecar is the authority the next command reads.
+	onDisk, loadErr := garminLoadIdentity(f.configPath)
+	if loadErr != nil {
+		t.Fatalf("reload identity: %v", loadErr)
+	}
+	if garminFormatTime(onDisk.RefreshExpiry) != reported {
+		t.Fatalf("sidecar refresh_expiry = %s, reported %s", garminFormatTime(onDisk.RefreshExpiry), reported)
+	}
+}
+
+// The symptom was reported against the human output, not the JSON envelope,
+// and the two output paths are separate blocks of Fprintf. This pins the
+// literal lines.
+func TestAuthStatusVerifyTextOutputReportsThePostRefreshChain(t *testing.T) {
+	f := newGarminVerifyFixture(t, true)
+
+	flags := &rootFlags{}
+	cmd := newGarminAuthStatusCmd(flags)
+	var out, errBuf bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errBuf)
+	cmd.SetArgs([]string{"--verify"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("auth status --verify: %v (stderr %q)", err, errBuf.String())
+	}
+
+	onDisk, err := garminLoadIdentity(f.configPath)
+	if err != nil {
+		t.Fatalf("reload identity: %v", err)
+	}
+	if onDisk.RefreshExpiry.Equal(f.loginRefreshExpiry) {
+		t.Fatal("the fixture never refreshed, so this test would assert nothing")
+	}
+	if want := "Refresh until:  " + garminFormatTime(onDisk.RefreshExpiry); !strings.Contains(out.String(), want) {
+		t.Fatalf("text output does not carry %q:\n%s", want, out.String())
+	}
+	if !strings.Contains(out.String(), "Needs refresh:  false") {
+		t.Fatalf("text output does not report the refreshed token as fresh:\n%s", out.String())
+	}
+}

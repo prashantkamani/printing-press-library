@@ -15,6 +15,8 @@
 // dates/date_range/daterange, so none of these series can be expressed in the
 // generated sync at all. This file owns the calendar walk; the generated sync
 // keeps owning the flat resources it can genuinely enumerate.
+//
+// pp:data-source live
 package cli
 
 import (
@@ -535,6 +537,22 @@ var errGarminRateLimited = errors.New("garmin rate-limited the request; the walk
 // reported once and acted on immediately rather than restated per call.
 var errGarminWallOfFailures = errors.New("every recent request failed; the walk stopped rather than continuing to ask")
 
+// errGarminWindowDenied marks a window the backward walk was refused.
+//
+// Garmin answers HTTP 403 to a date range that reaches past the start of the
+// account's own history — the same status it gives a credential that has gone
+// stale, with nothing in the response to tell the two apart. Where the walk is
+// does tell them apart. In the forward leg every window lies inside the
+// account's lifetime, so a 403 there is a fault and counts toward the wall. In
+// the backward leg it is the account's history start speaking, so it ends that
+// series' walk the way an empty window does and never counts toward the wall.
+//
+// Live on 2026-09-12: `history --backfill` exited 5 because the first backward
+// window of intensity_minutes answered 403 and ten refusals in a row across
+// the ranged series read as a dead credential, so the run stopped before
+// activities and every per-day series was attempted.
+var errGarminWindowDenied = errors.New("garmin refused this window")
+
 // defaultMaxConsecutiveFailures is how many failures in a row end a run. It is
 // well above the handful a flaky connection produces and well below the
 // hundreds a walk would otherwise spend proving the door is shut.
@@ -545,6 +563,17 @@ func isRateLimited(err error) bool {
 		return false
 	}
 	return strings.Contains(err.Error(), "HTTP 429") || strings.Contains(err.Error(), "rate limited")
+}
+
+// isForbidden matches on the message the way isRateLimited does. The client
+// rewraps an error whenever it masks credential text (internal/client
+// maskedError), which drops the *client.APIError the status code lives on, so
+// the status is only reliably readable as the text the error prints.
+func isForbidden(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "HTTP 403")
 }
 
 // isWalkAborted reports the two conditions that end a whole run rather than
@@ -630,6 +659,16 @@ type garminWalker struct {
 // get is the single choke point for every API call: it paces, counts, and
 // converts a 429 into the sentinel that stops the run.
 func (w *garminWalker) get(ctx context.Context, path string, params map[string]string) (json.RawMessage, error) {
+	return w.getClassified(ctx, path, params, false)
+}
+
+// getHistoryEdge is get for the backward leg of a windowed walk, the one place
+// a refused window is data rather than a fault. See errGarminWindowDenied.
+func (w *garminWalker) getHistoryEdge(ctx context.Context, path string, params map[string]string) (json.RawMessage, error) {
+	return w.getClassified(ctx, path, params, true)
+}
+
+func (w *garminWalker) getClassified(ctx context.Context, path string, params map[string]string, atHistoryEdge bool) (json.RawMessage, error) {
 	w.pacer.wait()
 	w.calls++
 	data, err := w.client.Get(ctx, path, params)
@@ -638,6 +677,14 @@ func (w *garminWalker) get(ctx context.Context, path string, params map[string]s
 		return nil, fmt.Errorf("%w: %v", errGarminRateLimited, err)
 	}
 	if err != nil {
+		if atHistoryEdge && isForbidden(err) {
+			// Neither counted nor cleared. Not counted, because a refusal
+			// past the history start is not a failing client; not cleared,
+			// because it is not a working one either, so a credential that
+			// has genuinely died still hits the wall on the next request it
+			// makes rather than walking every series to its ceiling first.
+			return nil, fmt.Errorf("%w: %v", errGarminWindowDenied, err)
+		}
 		w.consecutiveFailures++
 		limit := w.opts.maxConsecutiveFailures
 		if limit < 1 {
@@ -839,6 +886,13 @@ func (w *garminWalker) walkWindowed(ctx context.Context, s garminSeries) garminS
 			w.mirrorSyncState(s.name, st)
 			return out
 		}
+		// lastGoodWindow is the oldest window this run actually fetched, which
+		// is what a refusal below it makes a claim about.
+		lastGoodWindow := ""
+		// denied counts refusals so a walk that ends at the floor or the
+		// ceiling still says how many windows were refused rather than
+		// reporting them as ordinary empty ones.
+		denied := 0
 		stop := ""
 		for {
 			win, ok := planBackwardWindow(frontier, s.floor, s.windowDays)
@@ -847,17 +901,38 @@ func (w *garminWalker) walkWindowed(ctx context.Context, s garminSeries) garminS
 				break
 			}
 			path, params := s.windowReq(win, displayName)
-			data, callErr := w.get(ctx, path, params)
+			data, callErr := w.getHistoryEdge(ctx, path, params)
 			if callErr != nil {
 				if isWalkAborted(callErr) {
 					out.errored, out.err = true, callErr
 					return out
+				}
+				if errors.Is(callErr, errGarminWindowDenied) {
+					// A refused window is an empty window: it counts toward
+					// the ceiling and moves the frontier, so a re-run does
+					// not re-probe it, and the walk ends at the ceiling
+					// rather than at the wall.
+					empty++
+					denied++
+					frontier = win.start
+					st.FrontierDay = frontier.String()
+					st.EmptyWindows = empty
+					if saveErr := w.db.SaveGarminSeriesState(st); saveErr != nil {
+						out.errored, out.err = true, saveErr
+						return out
+					}
+					if empty >= w.opts.emptyWindowCeiling {
+						stop = "window_denied_stop"
+						break
+					}
+					continue
 				}
 				out.warned = true
 				w.emit.warn(s.name, "window_fetch_failed", "window "+win.String()+": "+callErr.Error())
 				stop = "interrupted"
 				break
 			}
+			lastGoodWindow = win.String()
 			rows, exErr := s.extract(data, win.end)
 			if exErr != nil {
 				out.warned = true
@@ -907,6 +982,17 @@ func (w *garminWalker) walkWindowed(ctx context.Context, s garminSeries) garminS
 			out.warned = true
 			w.emit.warn(s.name, "series_never_returned_data",
 				"every window came back empty and this series has never stored a row; earliest_day was left unset because an empty window cannot distinguish an account with no data from a request this tool got wrong")
+		}
+		if denied > 0 {
+			out.warned = true
+			msg := fmt.Sprintf("Garmin refused %d window(s) before this point (HTTP 403); those ranges reach past the account's history start and will not be re-requested.", denied)
+			if stop == "window_denied_stop" {
+				msg = fmt.Sprintf("Garmin refused %d window(s) before this point (HTTP 403); the walk stopped at the account's history start.", denied)
+			}
+			if lastGoodWindow != "" {
+				msg += " The earliest window it did fetch was " + lastGoodWindow + "."
+			}
+			w.emit.warn(s.name, "window_denied_stop", msg)
 		}
 		st.StopReason = stop
 		if saveErr := w.db.SaveGarminSeriesState(st); saveErr != nil {
@@ -1670,7 +1756,7 @@ func garminPinArchive(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600) // #nosec G304 -- app-derived archive path: garminArchivePath's own <data-dir>/data.db (--db never reaches here).
 	if err != nil {
 		return err
 	}

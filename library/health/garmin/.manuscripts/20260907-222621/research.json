@@ -1,8 +1,6 @@
 {
   "api_name": "garmin",
   "novelty_score": 8,
-  "recommendation": "proceed-with-gaps",
-  "researched_at": "2026-09-07T00:00:00Z",
   "alternatives": [
     {
       "name": "tcgoetz/GarminDB",
@@ -62,9 +60,8 @@
     "bpauli/gccli: loopback browser login on an ephemeral 127.0.0.1 port, so the tool never sees the password and never handles MFA or CAPTCHA.",
     "GarminDB: a durable local store is what makes multi-year questions answerable at all."
   ],
-  "auth": {
-    "canonical_env_var": "GARMIN_ACCESS_TOKEN"
-  },
+  "recommendation": "proceed-with-gaps",
+  "researched_at": "2026-09-07T00:00:00Z",
   "novel_features": [
     {
       "name": "Loopback browser login with identity assertion",
@@ -78,18 +75,41 @@
     {
       "name": "Windowed backfill of the 28-day-capped series",
       "command": "history",
-      "description": "Walks every daily-stats series backwards in 28-day windows into a local SQLite archive and resumes where it stopped.",
+      "description": "Walks the date-ranged daily-stats series backwards into a local SQLite archive and resumes where it stopped — 28-day windows where Garmin caps a request at 28 days, 364-day windows where it does not, and one request per day for the per-day series.",
       "rationale": "Garmin caps every daily-stats request at 28 days, so years of history exist only if something walks and stores them.",
       "example": "garmin-pp-cli history --backfill",
       "why_it_matters": "Run this before any trend question; every analytics command reads the archive, not the API.",
       "group": "Local state that compounds"
     }
   ],
+  "novel_features_built": [
+    {
+      "name": "Loopback browser login with identity assertion",
+      "command": "auth login",
+      "description": "Signs in through Garmin's own page in your browser, catches the redirect on a loopback port, and refuses to store a token whose account email does not match the one you named.",
+      "rationale": "Every other client either takes your password or scrapes a browser cookie; a shared browser session silently signs in the wrong household member, and only an identity check catches it.",
+      "example": "garmin-pp-cli auth login --email you@example.com",
+      "why_it_matters": "Use this once per Garmin account per home; after it, everything else works unattended from the refresh token.",
+      "group": "Auth you can trust with a household"
+    },
+    {
+      "name": "Windowed backfill of the 28-day-capped series",
+      "command": "history",
+      "description": "Walks the date-ranged daily-stats series backwards into a local SQLite archive and resumes where it stopped — 28-day windows where Garmin caps a request at 28 days, 364-day windows where it does not, and one request per day for the per-day series.",
+      "rationale": "Garmin caps every daily-stats request at 28 days, so years of history exist only if something walks and stores them.",
+      "example": "garmin-pp-cli history --backfill",
+      "why_it_matters": "Run this before any trend question; every analytics command reads the archive, not the API.",
+      "group": "Local state that compounds"
+    }
+  ],
+  "auth": {
+    "canonical_env_var": "GARMIN_ACCESS_TOKEN"
+  },
   "narrative": {
     "display_name": "Garmin Connect",
     "headline": "Your whole Garmin history in a local database, not one 28-day page at a time.",
     "value_prop": "Garmin Connect caps every daily-stats request at 28 days and offers no personal API token, which is why the ecosystem is a handful of Python libraries rather than a tool you can call. This CLI signs in through your own browser, keeps each account's tokens in its own home, walks the whole history into SQLite, and answers sleep, training, heart-rate and activity questions from the archive with JSON on stdout.",
-    "auth_narrative": "Garmin issues no personal API key. Sign-in goes through Garmin's own page in your browser: `auth login` opens it, catches the redirect back to a loopback port on 127.0.0.1, exchanges the ticket for an access token and a refresh token, and checks the account email on the resulting token against the one you named before writing anything to disk. The password never reaches this CLI, and the refresh token keeps the session alive without another browser visit. For a second household account, sign out of Garmin in the browser and run `auth login` again under that account's own GARMIN_HOME.",
+    "auth_narrative": "Garmin issues no personal API key. Sign-in goes through Garmin's own page in your browser: `auth login` opens it, catches the redirect back to a loopback port on 127.0.0.1, exchanges the ticket for an access token and a refresh token, and checks the account email on the resulting token against the one you named before writing anything to disk. The password never reaches this CLI, and the refresh token keeps the session alive without another browser visit. A token supplied through GARMIN_ACCESS_TOKEN or GARMIN_TOKEN is used as-is instead: it is never refreshed, it is not this home's stored chain, and plain `auth status` reports it as not this home's asserted account (run `auth status --verify` to have Garmin confirm which account that token belongs to). One Garmin account per home. To connect a second household account, in this order: sign out of Garmin in the browser; run the login under that account's own home with `GARMIN_HOME=~/.local/share/garmin-homes/other garmin-pp-cli auth login --email other@example.com`; confirm the account email the login prints is the one you meant; sign out of Garmin in the browser again. Clearing browser cookies is never required, and this CLI never attempts it — those sign-outs are ordinary sign-outs on Garmin's own site, so the choreography works for a user with no file-system access to the browser profile. Check which account a home holds with `garmin-pp-cli auth status` (add `--verify` to confirm it with one call to Garmin), and clear a home's stored chain with `garmin-pp-cli auth logout`.",
     "quickstart": [
       {
         "command": "garmin-pp-cli auth login --email you@example.com",
@@ -100,11 +120,15 @@
         "comment": "Confirms the token works and prints the displayName the rest of the commands need."
       },
       {
-        "command": "garmin-pp-cli sync",
-        "comment": "Walks the 28-day-capped series into the local archive; the first run backfills, later runs are incremental."
+        "command": "garmin-pp-cli history --backfill",
+        "comment": "Walks the date-ranged daily-stats series backwards into the local archive; the first run backfills, later runs resume."
       },
       {
-        "command": "garmin-pp-cli sleep stats 2026-08-01 2026-08-28",
+        "command": "garmin-pp-cli sync",
+        "comment": "Refreshes the activities feed and its per-activity detail; it does not walk the windowed daily-stats series, so history still owns that job."
+      },
+      {
+        "command": "garmin-pp-cli sleep stats --start 2026-08-01 --end 2026-08-28",
         "comment": "A month of nightly sleep summaries straight from Garmin."
       }
     ],
@@ -119,19 +143,36 @@
       },
       {
         "symptom": "A range longer than 28 days returns fewer rows than expected.",
-        "fix": "Garmin caps daily-stats requests at 28 calendar days. Use `sync` and query the local archive instead of asking one endpoint for a long range."
+        "fix": "Garmin caps daily-stats requests at 28 calendar days. Use `history` and query the local archive instead of asking one endpoint for a long range; `sync` alone does not walk this series."
       },
       {
         "symptom": "Commands read the wrong person's data on a shared machine.",
         "fix": "Set GARMIN_HOME (or pass --home) per account; `doctor --json` prints which home directory each kind resolved to and why."
       }
     ],
-    "when_to_use": "Reach for this CLI for any question about the owner's Garmin Connect history: sleep trends, training status and readiness, VO2 max, resting heart rate, step and intensity-minute trends, heart-rate zones, and the activity feed. It is at its best on questions that span months or years, because those are answered from the local archive rather than from Garmin's 28-day pages. Sync first, then query.",
+    "when_to_use": "Reach for this CLI for any question about the owner's Garmin Connect history: sleep trends, training status and readiness, VO2 max, resting heart rate, step and intensity-minute trends, heart-rate zones, and the activity feed. It is at its best on questions that span months or years, because those are answered from the local archive rather than from Garmin's 28-day pages. Run `history` first to fill the daily-stats archive, then `sync` when you want the generated activity detail refreshed, then query.",
     "anti_triggers": [
       "Do not use it to write anything to Garmin Connect: every command is read-only.",
       "Do not use it for another person's Garmin account without their own login in their own home.",
       "Do not use it as a live device feed; data appears only after the watch or bike computer syncs to Garmin Connect.",
       "Do not use it for Strava, Apple Health, Whoop or Oura data."
+    ],
+    "recipes": [
+      {
+        "title": "Four weeks of sleep score in one call",
+        "command": "garmin-pp-cli sleep score-stats --start 2026-08-10 --end 2026-09-06",
+        "explanation": "The score trend is server-aggregated, so a month costs one request instead of twenty-eight per-night calls."
+      },
+      {
+        "title": "What this account actually does",
+        "command": "garmin-pp-cli activities breakdown --aggregation lifetime --metric duration",
+        "explanation": "Lifetime totals grouped by activity type, computed by Garmin, without paging the activity list."
+      },
+      {
+        "title": "Time in zone for the last ride",
+        "command": "garmin-pp-cli activities list --limit 1 --json | jq -r '.[0].activityId' | xargs garmin-pp-cli activities hr-time-in-zones",
+        "explanation": "Zone seconds for one activity; pair it with `heart-rate zones` to label the zones."
+      }
     ],
     "trigger_phrases": [
       "garmin",
@@ -145,23 +186,6 @@
       "heart rate zones",
       "days active",
       "activity breakdown"
-    ],
-    "recipes": [
-      {
-        "title": "Four weeks of sleep score in one call",
-        "command": "garmin-pp-cli sleep score-stats 2026-08-10 2026-09-06",
-        "explanation": "The score trend is server-aggregated, so a month costs one request instead of twenty-eight per-night calls."
-      },
-      {
-        "title": "What this account actually does",
-        "command": "garmin-pp-cli activities breakdown --aggregation lifetime --metric duration",
-        "explanation": "Lifetime totals grouped by activity type, computed by Garmin, without paging the activity list."
-      },
-      {
-        "title": "Time in zone for the last ride",
-        "command": "garmin-pp-cli activities list --limit 1 --json | jq -r '.[0].activityId' | xargs garmin-pp-cli activities hr-time-in-zones",
-        "explanation": "Zone seconds for one activity; pair it with `heart-rate zones` to label the zones."
-      }
     ]
   }
 }

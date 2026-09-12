@@ -51,7 +51,8 @@ type GarminSeriesState struct {
 	// day before this one, so a run stopped mid-walk does not re-probe.
 	FrontierDay string
 	// StopReason records why the backward walk stopped: "empty_window_ceiling",
-	// "floor", "never_returned_data", "interrupted", or "" when it has not run.
+	// "window_denied_stop", "floor", "never_returned_data", "interrupted",
+	// "feed_exhausted" (the activities feed), or "" when it has not run.
 	StopReason string
 	// EmptyWindows counts consecutive empty windows at the frontier. It is
 	// reset by any window that returns rows.

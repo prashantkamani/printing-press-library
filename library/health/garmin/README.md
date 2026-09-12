@@ -119,14 +119,7 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 
 ## Authentication
 
-Garmin issues no personal API key. Sign-in goes through Garmin's own page in your browser: `auth login` opens it, catches the redirect back to a loopback port on 127.0.0.1, exchanges the ticket for an access token and a refresh token, and checks the account email on the resulting token against the one you named before writing anything to disk. The password never reaches this CLI, and the refresh token keeps the session alive without another browser visit. One Garmin account per home. To connect a second household account, in this order:
-
-1. Sign out of Garmin in the browser.
-2. Run `GARMIN_HOME=<that account's directory> garmin-pp-cli auth login --email <that account>`.
-3. Confirm the account email the login prints is the one you meant.
-4. Sign out of Garmin in the browser again.
-
-Clearing browser cookies is never required, and this CLI never attempts it — steps 1 and 4 are ordinary sign-outs on Garmin's own site.
+Garmin issues no personal API key. Sign-in goes through Garmin's own page in your browser: `auth login` opens it, catches the redirect back to a loopback port on 127.0.0.1, exchanges the ticket for an access token and a refresh token, and checks the account email on the resulting token against the one you named before writing anything to disk. The password never reaches this CLI, and the refresh token keeps the session alive without another browser visit. A token supplied through GARMIN_ACCESS_TOKEN or GARMIN_TOKEN is used as-is instead: it is never refreshed, it is not this home's stored chain, and plain `auth status` reports it as not this home's asserted account (run `auth status --verify` to have Garmin confirm which account that token belongs to). One Garmin account per home. To connect a second household account, in this order: sign out of Garmin in the browser; run the login under that account's own home with `GARMIN_HOME=~/.local/share/garmin-homes/other garmin-pp-cli auth login --email other@example.com`; confirm the account email the login prints is the one you meant; sign out of Garmin in the browser again. Clearing browser cookies is never required, and this CLI never attempts it — those sign-outs are ordinary sign-outs on Garmin's own site, so the choreography works for a user with no file-system access to the browser profile. Check which account a home holds with `garmin-pp-cli auth status` (add `--verify` to confirm it with one call to Garmin), and clear a home's stored chain with `garmin-pp-cli auth logout`.
 
 ## Quick Start
 
@@ -134,17 +127,17 @@ Clearing browser cookies is never required, and this CLI never attempts it — s
 # One browser sign-in; the email you pass is checked against the account that actually signed in.
 garmin-pp-cli auth login --email you@example.com
 
-
 # Confirms the token works and prints the displayName the rest of the commands need.
 garmin-pp-cli account social-profile
 
+# Walks the date-ranged daily-stats series backwards into the local archive; the first run backfills, later runs resume.
+garmin-pp-cli history --backfill
 
-# Walks the 28-day-capped series into the local archive; the first run backfills, later runs are incremental.
+# Refreshes the activities feed and its per-activity detail; it does not walk the windowed daily-stats series, so history still owns that job.
 garmin-pp-cli sync
 
-
 # A month of nightly sleep summaries straight from Garmin.
-garmin-pp-cli sleep stats 2026-08-01 2026-08-28
+garmin-pp-cli sleep stats --start 2026-08-01 --end 2026-08-28
 
 ```
 
@@ -153,7 +146,6 @@ garmin-pp-cli sleep stats 2026-08-01 2026-08-28
 These capabilities aren't available in any other tool for this API.
 
 ### Auth you can trust with a household
-
 - **`auth login`** — Signs in through Garmin's own page in your browser, catches the redirect on a loopback port, and refuses to store a token whose account email does not match the one you named.
 
   _Use this once per Garmin account per home; after it, everything else works unattended from the refresh token._
@@ -163,8 +155,7 @@ These capabilities aren't available in any other tool for this API.
   ```
 
 ### Local state that compounds
-
-- **`history`** — Walks every daily-stats series backwards in 28-day windows into a local SQLite archive and resumes where it stopped.
+- **`history`** — Walks the date-ranged daily-stats series backwards into a local SQLite archive and resumes where it stopped — 28-day windows where Garmin caps a request at 28 days, 364-day windows where it does not, and one request per day for the per-day series.
 
   _Run this before any trend question; every analytics command reads the archive, not the API._
 
@@ -174,11 +165,10 @@ These capabilities aren't available in any other tool for this API.
 
 ## Recipes
 
-
 ### Four weeks of sleep score in one call
 
 ```bash
-garmin-pp-cli sleep score-stats 2026-08-10 2026-09-06
+garmin-pp-cli sleep score-stats --start 2026-08-10 --end 2026-09-06
 ```
 
 The score trend is server-aggregated, so a month costs one request instead of twenty-eight per-night calls.
@@ -253,6 +243,15 @@ Relocation is one-way. Unsetting `GARMIN_HOME` does not move files back to platf
 Existing installs keep working because the platform-default rung matches the legacy layout. On the first auth write, stored secrets leave `config.toml` and are consolidated into `credentials.toml` under the data directory. Run `garmin-pp-cli doctor --fail-on warn` to check path and credential-location warnings in automation.
 
 ## Commands
+
+The novel `history` verb walks the date-ranged daily-stats series backwards into the local archive
+and resumes where it stopped — 28-day windows where Garmin caps a request at 28 days (sleep stats,
+sleep score, steps), 364-day windows where it does not (resting HR, VO2 max, intensity minutes), and
+one request per day for the per-day series (daily summary, sleep detail, daily HR, training
+readiness), bounded by `--days`. The generated `sync` verb covers the activities feed and its
+per-activity detail (activity, HR zones, splits) — the flat resources the press can enumerate — and
+cannot walk those windows itself. `history` is the command that keeps the archive current; run
+`sync` when you want the generated activity detail refreshed on its own.
 
 ### account
 
@@ -332,15 +331,17 @@ the fallback if the account-scoped path ever changes.
 than fetching per-night detail when the question is about a trend rather than one night. At most
 28 calendar days per request.
 - **`garmin-pp-cli sleep stats`** - One row per night between `start` and `end`, aggregated by Garmin. At most 28 calendar days per
-request; longer ranges are walked in 28-day windows by `sync` and de-duplicated on the calendar
-date. Rows arrive under `individualStats`.
+request; `history` walks longer ranges backwards in 28-day windows into the local archive and
+de-duplicates on the calendar date. The generated `sync` verb does not chunk this series. Rows
+arrive under `individualStats`.
 
 ### steps
 
 Daily and weekly step totals against the account's goal.
 
 - **`garmin-pp-cli steps daily`** - One row per calendar date with total steps, the step goal and the distance walked. At most 28
-calendar days per request; `sync` walks longer ranges in windows.
+calendar days per request; `history` walks longer ranges in 28-day windows into the local archive.
+The generated `sync` verb does not chunk this series.
 - **`garmin-pp-cli steps weekly`** - Weekly step buckets instead of daily ones, which covers about a year in a single request where
 the daily form would take thirteen. Use it for long-horizon trend questions and fall back to the
 daily form when a specific date matters.
@@ -460,13 +461,10 @@ If you use agentcookie to sync secrets across machines, this CLI auto-adopts age
 - Run the `list` command to see available items
 
 ### API-specific
-
 - **`auth login` reports that the signed-in account does not match --email.** — Another Garmin session owned the browser. Sign out of Garmin in the browser, then run `auth login` again; nothing was written to your home.
 - **Every wellness series comes back empty while activities are present.** — The account has no wearable paired. Bike computers and trainers record activities but no sleep, heart-rate or body-battery series; check `daily-summary` for `includesWellnessData` before assuming a bug.
-- **A range longer than 28 days returns fewer rows than expected.** — Garmin caps daily-stats requests at 28 calendar days. Use `history` and query the local archive instead of asking one endpoint for a long range.
+- **A range longer than 28 days returns fewer rows than expected.** — Garmin caps daily-stats requests at 28 calendar days. Use `history` and query the local archive instead of asking one endpoint for a long range; `sync` alone does not walk this series.
 - **Commands read the wrong person's data on a shared machine.** — Set GARMIN_HOME (or pass --home) per account; `doctor --json` prints which home directory each kind resolved to and why.
-
----
 
 ## Sources & Inspiration
 
