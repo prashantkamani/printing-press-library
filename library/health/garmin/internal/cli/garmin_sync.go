@@ -5,16 +5,21 @@
 //
 // `garmin-pp-cli history` — the windowed archive walk.
 //
-// Why this exists beside the generated `sync` rather than inside it: Garmin
-// has no "give me everything since X" list endpoint. Its daily statistics come
-// from range endpoints whose path IS the date range, capped at 28 days per
-// request (verified live 2026-09-07 — see the per-series windowDays notes
-// below), and its per-day endpoints answer for exactly one date. The press's
-// profiler only marks an endpoint syncable when its path has no parameters,
-// and its only temporal flag is --dates for a query parameter literally named
+// Why this exists rather than the generated `sync`: Garmin has no "give me
+// everything since X" list endpoint. Its daily statistics come from range
+// endpoints whose path IS the date range, capped at 28 days per request
+// (verified live 2026-09-07 — see the per-series windowDays notes below), and
+// its per-day endpoints answer for exactly one date. The press's profiler only
+// marks an endpoint syncable when its path has no parameters, and its only
+// temporal flag is --dates for a query parameter literally named
 // dates/date_range/daterange, so none of these series can be expressed in the
-// generated sync at all. This file owns the calendar walk; the generated sync
-// keeps owning the flat resources it can genuinely enumerate.
+// generated sync at all.
+//
+// This file owns the whole archive (N131 decision D11, 2026-09-13): the
+// calendar walk, the activity feed, the per-activity fan-outs the generated
+// sync used to make — detail, splits and heart-rate zones — and the account's
+// zone configuration. The generated `sync` is left compiled but unregistered
+// and answers with a pointer here; see internal/cli/garmin_sync_stub.go.
 //
 // pp:data-source live
 package cli
@@ -57,6 +62,10 @@ const (
 	seriesOffsetPaged
 	// seriesPerParent fans out over ids already stored by another series.
 	seriesPerParent
+	// seriesSingleDocument is one request answering for the whole account
+	// rather than for a date or an id: the response is the document, and
+	// the archive keeps exactly one row of it.
+	seriesSingleDocument
 )
 
 // garminRow is one extracted record: the id it is stored under and the
@@ -94,6 +103,22 @@ type garminSeries struct {
 	windowReq func(w dayWindow, displayName string) (string, map[string]string)
 	// dayReq builds the request for one date (seriesPerDay).
 	dayReq func(d civilDay, displayName string) (string, map[string]string)
+
+	// parentResource is the store resource a seriesPerParent series fans
+	// out over, parentNoun is how one of its rows is named in a message,
+	// childReq builds the request for one parent id, and wrapChild turns
+	// the response into the object stored under that id.
+	parentResource string
+	parentNoun     string
+	childReq       func(id string) (string, map[string]string)
+	wrapChild      func(id string, raw json.RawMessage) (json.RawMessage, error)
+
+	// docReq builds the one request of a seriesSingleDocument series,
+	// docID is the fixed id its single row is stored under, and wrapDoc
+	// turns the response into that row.
+	docReq  func() (string, map[string]string)
+	docID   string
+	wrapDoc func(raw json.RawMessage) (json.RawMessage, error)
 	// extract turns one response into rows. `requested` is the day or window
 	// end that was asked for, used as the day of a payload that carries no
 	// calendar field of its own.
@@ -188,7 +213,60 @@ func garminSeriesCatalog() []garminSeries {
 		},
 		{
 			name: "activity_hr_zones", kind: seriesPerParent, resource: "activity_hr_zones",
-			summary: "Seconds in each heart-rate zone, per activity.",
+			summary:        "Seconds in each heart-rate zone, per activity.",
+			parentResource: "activities", parentNoun: "activity",
+			childReq: func(id string) (string, map[string]string) {
+				return "/activity-service/activity/" + id + "/hrTimeInZones", nil
+			},
+			wrapChild: wrapArrayChild("activityId", "hrTimeInZones", "zoneCount"),
+		},
+		{
+			name: "activity_detail", kind: seriesPerParent, resource: "activity_detail",
+			summary:        "The full record of one activity: splits summary, device, weather, laps metadata.",
+			parentResource: "activities", parentNoun: "activity",
+			childReq: func(id string) (string, map[string]string) {
+				return "/activity-service/activity/" + id, nil
+			},
+			// Stored exactly as Garmin returned it. The generated sync
+			// scopes this payload to $.activity for its typed table
+			// (internal/cli/sync.go:2231); the archive keeps the whole
+			// document instead, because $.activity is a projection for one
+			// table's columns and every sibling key it drops — summary
+			// totals, device, weather — is the reason to fetch detail at
+			// all. The response is already an object carrying its own
+			// activityId, so no wrapper is needed to keep the row keyed.
+			wrapChild: storeChildAsReturned,
+		},
+		{
+			name: "activity_splits", kind: seriesPerParent, resource: "activity_splits",
+			summary:        "Lap and split records for one activity.",
+			parentResource: "activities", parentNoun: "activity",
+			childReq: func(id string) (string, map[string]string) {
+				return "/activity-service/activity/" + id + "/splits", nil
+			},
+			// Wrapped, and it stays wrapped. Live 2026-09-13 the response is an
+			// object carrying activityId, lapDTOs and eventDTOs, so the store would
+			// accept it unwrapped — but 1 000 rows are already archived in the
+			// wrapped shape, and the wrapper is what keys a row back to its parent
+			// without trusting a body field the spec declares only as a
+			// FreeFormObject (spec.yaml:1090).
+			wrapChild: wrapChildDocument("activityId", "splits"),
+		},
+		{
+			name: "hr_zone_config", kind: seriesSingleDocument, resource: "hr_zone_config",
+			summary: "The account's heart-rate zone configuration: the boundaries every per-activity zone row is measured against.",
+			docReq: func() (string, map[string]string) {
+				return "/biometric-service/heartRateZones", nil
+			},
+			// One fixed id, no calendar day. This series is the account's
+			// current zone settings, not a dated observation: there is one
+			// live configuration at a time, so the row is stored under
+			// "current" and every re-run upserts that same row in place.
+			// Stamping it with a day would turn a setting into a fake time
+			// series that grows a row per run and never answers "what are
+			// the zones now" without a max() over it.
+			docID:   garminHRZoneConfigID,
+			wrapDoc: wrapSingleDocument("heartRateZones"),
 		},
 		{
 			name: "daily_summary", kind: seriesPerDay, resource: "daily_summary",
@@ -245,6 +323,99 @@ func garminSeriesNames() []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// garminHRZoneConfigID is the single id the heart-rate zone configuration is
+// stored under. See the hr_zone_config catalog entry for why it is fixed.
+const garminHRZoneConfigID = "current"
+
+// ---------------------------------------------------------------------------
+// Child-document wrapping
+//
+// UpsertKeyedBatch skips any row whose document is not a JSON object
+// (internal/store/garmin_series.go:201-205), and a bare array carries no id of
+// its own, so a response that is not already a keyed object has to be wrapped
+// before it can be archived. Each wrapper below says which of those two
+// problems it is solving.
+// ---------------------------------------------------------------------------
+
+// perParentShapeError is what a wrapper returns when a response cannot be
+// stored as fetched. It carries the reason code and the counts the anomaly
+// event records, so the walk reports what the payload actually did rather than
+// one generic code for every cause.
+type perParentShapeError struct {
+	reason   string
+	consumed int
+	stored   int
+}
+
+func (e *perParentShapeError) Error() string { return e.reason }
+
+// wrapArrayChild wraps a bare-array response with the parent id it belongs to
+// and the element count. Without the id every parent's payload would collide
+// under one storage key; the count is what makes an empty answer visible
+// without re-parsing the blob. A response that is not an array is reported
+// rather than stored under a guess.
+func wrapArrayChild(idKey, arrayKey, countKey string) func(string, json.RawMessage) (json.RawMessage, error) {
+	return func(id string, raw json.RawMessage) (json.RawMessage, error) {
+		var items []json.RawMessage
+		if err := json.Unmarshal(raw, &items); err != nil {
+			return nil, &perParentShapeError{reason: "per_parent_shape_unrecognized"}
+		}
+		wrapped, err := json.Marshal(map[string]any{
+			idKey:             id,
+			arrayKey:          json.RawMessage(raw),
+			countKey:          len(items),
+			"garminWrappedBy": "history",
+		})
+		if err != nil {
+			return nil, &perParentShapeError{reason: "per_parent_wrap_failed", consumed: 1}
+		}
+		return wrapped, nil
+	}
+}
+
+// wrapChildDocument wraps whatever the endpoint returned under one key beside
+// the parent id, without asserting the payload's shape. It is for a child
+// endpoint whose live shape this tool has not yet seen: array or object, the
+// stored row is one object keyed by its parent.
+func wrapChildDocument(idKey, bodyKey string) func(string, json.RawMessage) (json.RawMessage, error) {
+	return func(id string, raw json.RawMessage) (json.RawMessage, error) {
+		wrapped, err := json.Marshal(map[string]any{
+			idKey:             id,
+			bodyKey:           raw,
+			"garminWrappedBy": "history",
+		})
+		if err != nil {
+			return nil, &perParentShapeError{reason: "per_parent_wrap_failed", consumed: 1}
+		}
+		return wrapped, nil
+	}
+}
+
+// storeChildAsReturned keeps an object response byte-for-byte. The guard is
+// the store's own rule, so a payload that reaches storeRows here is one
+// UpsertKeyedBatch will accept rather than silently skip.
+func storeChildAsReturned(_ string, raw json.RawMessage) (json.RawMessage, error) {
+	if _, err := store.DecodeJSONObject(raw); err != nil {
+		return nil, &perParentShapeError{reason: "per_parent_shape_unrecognized"}
+	}
+	return raw, nil
+}
+
+// wrapSingleDocument wraps a whole-account response under one key so it is an
+// object regardless of what the endpoint returned.
+func wrapSingleDocument(bodyKey string) func(json.RawMessage) (json.RawMessage, error) {
+	return func(raw json.RawMessage) (json.RawMessage, error) {
+		wrapped, err := json.Marshal(map[string]any{
+			bodyKey:           raw,
+			"garminWrappedBy": "history",
+		})
+		if err != nil {
+			return nil, &perParentShapeError{reason: "document_wrap_failed", consumed: 1}
+		}
+		return wrapped, nil
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1241,20 +1412,25 @@ func activityIDOf(item json.RawMessage) string {
 	return ""
 }
 
-// walkActivityHRZones fetches per-zone seconds for activities that do not
-// have them yet. The payload is a bare five-element array with no id of its
-// own, so it is wrapped with its activity id before storage — otherwise every
-// activity's zones would collide under one key.
-func (w *garminWalker) walkActivityHRZones(ctx context.Context, s garminSeries) garminSeriesOutcome {
+// walkPerParent fetches one child document per parent id that has no row in
+// this series yet. The parent ids come from another series' stored rows, so a
+// fan-out never enumerates anything the archive has not already seen, and
+// MissingResourceIDs is what makes a re-run cost only the new parents.
+//
+// Each series supplies its own child URL and its own wrapper. The wrapper
+// matters because several of these endpoints answer with a bare array, which
+// carries no id of its own and which the store will not accept as a document
+// at all; see the wrapping section above.
+func (w *garminWalker) walkPerParent(ctx context.Context, s garminSeries) garminSeriesOutcome {
 	out := garminSeriesOutcome{series: s.name}
-	parents, err := w.db.ResourceIDsNewestFirst("activities", 0)
+	parents, err := w.db.ResourceIDsNewestFirst(s.parentResource, 0)
 	if err != nil {
 		out.errored, out.err = true, err
 		return out
 	}
 	if len(parents) == 0 {
 		w.emit.warn(s.name, "parent_table_empty",
-			"no activities are stored yet, so there is nothing to fan out over; sync the activities series first")
+			"no "+s.parentResource+" are stored yet, so there is nothing to fan out over; sync the "+s.parentResource+" series first")
 		out.warned = true
 		return out
 	}
@@ -1263,6 +1439,7 @@ func (w *garminWalker) walkActivityHRZones(ctx context.Context, s garminSeries) 
 		out.errored, out.err = true, err
 		return out
 	}
+	outstanding := len(missing)
 	capped := false
 	if w.opts.maxDependents > 0 && len(missing) > w.opts.maxDependents {
 		missing = missing[:w.opts.maxDependents]
@@ -1274,31 +1451,25 @@ func (w *garminWalker) walkActivityHRZones(ctx context.Context, s garminSeries) 
 		return out
 	}
 	for _, id := range missing {
-		data, callErr := w.get(ctx, "/activity-service/activity/"+id+"/hrTimeInZones", nil)
+		path, params := s.childReq(id)
+		data, callErr := w.get(ctx, path, params)
 		if callErr != nil {
 			if isWalkAborted(callErr) {
 				out.errored, out.err = true, callErr
 				return out
 			}
 			out.warned = true
-			w.emit.warn(s.name, "per_parent_fetch_failed", "activity "+id+": "+callErr.Error())
+			w.emit.warn(s.name, "per_parent_fetch_failed", s.parentNoun+" "+id+": "+callErr.Error())
 			continue
 		}
-		var zones []json.RawMessage
-		if err := json.Unmarshal(data, &zones); err != nil {
+		wrapped, wrapErr := s.wrapChild(id, data)
+		if wrapErr != nil {
 			out.warned = true
-			w.emit.anomaly(s.name, "per_parent_shape_unrecognized", 0, 0)
-			continue
-		}
-		wrapped, err := json.Marshal(map[string]any{
-			"activityId":      id,
-			"hrTimeInZones":   json.RawMessage(data),
-			"zoneCount":       len(zones),
-			"garminWrappedBy": "history",
-		})
-		if err != nil {
-			out.warned = true
-			w.emit.anomaly(s.name, "per_parent_wrap_failed", 1, 0)
+			var shape *perParentShapeError
+			if !errors.As(wrapErr, &shape) {
+				shape = &perParentShapeError{reason: "per_parent_wrap_failed", consumed: 1}
+			}
+			w.emit.anomaly(s.name, shape.reason, shape.consumed, shape.stored)
 			continue
 		}
 		stored, storeErr := w.storeRows(s, []garminRow{{id: id, data: wrapped}})
@@ -1316,9 +1487,62 @@ func (w *garminWalker) walkActivityHRZones(ctx context.Context, s garminSeries) 
 	if capped {
 		out.warned = true
 		w.emit.warn(s.name, "max_dependents_cap_hit",
-			fmt.Sprintf("stopped after %d activities; re-run to continue, or raise --max-dependents", w.opts.maxDependents))
+			fmt.Sprintf("stopped after %d %s; re-run to continue, or raise --max-dependents", w.opts.maxDependents, s.parentResource))
 	}
-	w.emit.progress(s.name, out.stored, fmt.Sprintf("%d pending", len(missing)))
+	w.emit.progress(s.name, out.stored, fmt.Sprintf("%d pending", outstanding-out.stored))
+	w.mirrorSyncState(s.name, st)
+	return out
+}
+
+// walkSingleDocument fetches one whole-account document and keeps exactly one
+// row of it. There is no calendar walk and no id to fan out over: the request
+// is the same every run and the row is replaced in place, so the archive
+// always holds the current document rather than a pile of dated copies.
+func (w *garminWalker) walkSingleDocument(ctx context.Context, s garminSeries) garminSeriesOutcome {
+	out := garminSeriesOutcome{series: s.name}
+	st, err := w.db.GetGarminSeriesState(s.name)
+	if err != nil {
+		out.errored, out.err = true, err
+		return out
+	}
+	path, params := s.docReq()
+	data, callErr := w.get(ctx, path, params)
+	if callErr != nil {
+		if isWalkAborted(callErr) {
+			out.errored, out.err = true, callErr
+			return out
+		}
+		out.warned = true
+		w.emit.warn(s.name, "document_fetch_failed", callErr.Error())
+		return out
+	}
+	wrapped, wrapErr := s.wrapDoc(data)
+	if wrapErr != nil {
+		out.warned = true
+		var shape *perParentShapeError
+		if !errors.As(wrapErr, &shape) {
+			shape = &perParentShapeError{reason: "document_wrap_failed", consumed: 1}
+		}
+		w.emit.anomaly(s.name, shape.reason, shape.consumed, shape.stored)
+		return out
+	}
+	stored, storeErr := w.storeRows(s, []garminRow{{id: s.docID, data: wrapped}})
+	if storeErr != nil {
+		out.errored, out.err = true, storeErr
+		return out
+	}
+	out.stored += stored
+	// Assigned, not accumulated. Every other series only ever stores rows it
+	// did not have, so a running total is its row count; this one re-stores
+	// the same id every run, and mirrorSyncState publishes this number to the
+	// generated sync_state that doctor and tail read. Adding would make a
+	// one-row table report one row per run ever made.
+	st.TotalRows = stored
+	if saveErr := w.db.SaveGarminSeriesState(st); saveErr != nil {
+		out.errored, out.err = true, saveErr
+		return out
+	}
+	w.emit.progress(s.name, out.stored, s.docID)
 	w.mirrorSyncState(s.name, st)
 	return out
 }
@@ -1336,7 +1560,9 @@ func (w *garminWalker) walkSeries(ctx context.Context, s garminSeries) garminSer
 	case seriesOffsetPaged:
 		out = w.walkActivities(ctx, s)
 	case seriesPerParent:
-		out = w.walkActivityHRZones(ctx, s)
+		out = w.walkPerParent(ctx, s)
+	case seriesSingleDocument:
+		out = w.walkSingleDocument(ctx, s)
 	default:
 		return garminSeriesOutcome{series: s.name, warned: true}
 	}
@@ -1380,6 +1606,8 @@ func kindName(k garminSeriesKind) string {
 		return "offset_paged"
 	case seriesPerParent:
 		return "per_parent"
+	case seriesSingleDocument:
+		return "single_document"
 	}
 	return "unknown"
 }
@@ -1406,7 +1634,10 @@ func planGarminForwardWork(selected []garminSeries, end civilDay, days int) []ga
 			entry.Note = "pages until the feed reaches an already-complete day"
 		case seriesPerParent:
 			entry.Requests = -1
-			entry.Note = "one request per activity that has no zone row yet"
+			entry.Note = "one request per " + s.parentNoun + " that has no row in this series yet"
+		case seriesSingleDocument:
+			entry.Requests = 1
+			entry.Note = "one request for the whole account; the single row is replaced in place"
 		}
 		out = append(out, entry)
 	}
@@ -1625,7 +1856,7 @@ explicit choice, not a default.`,
 	cmd.Flags().IntVar(&maxPages, "max-pages", 0,
 		"Cap on activity-feed pages (0 = until the feed ends or reaches an already-complete day).")
 	cmd.Flags().IntVar(&maxDependents, "max-dependents", 500,
-		"Cap on per-activity heart-rate-zone fetches in one run (0 = no cap).")
+		"Cap on per-activity fetches per fan-out series — heart-rate zones, detail, splits — in one run (0 = no cap).")
 	cmd.Flags().IntVar(&pageSize, "page-size", 100, "Activity-feed page size.")
 	cmd.Flags().BoolVar(&strict, "strict", false, "Exit non-zero when any series fails. By default a failed series warns and the run continues.")
 	cmd.Flags().IntVar(&maxConsecutiveFailures, "max-consecutive-failures", defaultMaxConsecutiveFailures,

@@ -615,6 +615,189 @@ func TestWalkActivityHRZones_FetchesOnlyActivitiesWithoutZones(t *testing.T) {
 	}
 }
 
+func TestWalkPerParent_ActivityDetailIsStoredAsGarminReturnedIt(t *testing.T) {
+	db := testStore(t)
+	if err := db.Upsert("activities", "11", json.RawMessage(`{"activityId":11}`)); err != nil {
+		t.Fatalf("seed activity: %v", err)
+	}
+	api := &fakeGarmin{respond: func(fakeCall, int) (json.RawMessage, error) {
+		return json.RawMessage(`{"activityId":11,"summaryDTO":{"distance":5000},"metadataDTO":{"deviceApplicationInstallationId":1}}`), nil
+	}}
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{now: fixedClock("2026-09-08")})
+	out := w.walkSeries(context.Background(), seriesNamed(t, "activity_detail"))
+	if out.errored {
+		t.Fatalf("detail fan-out errored: %v", out.err)
+	}
+	if len(api.calls) != 1 || api.calls[0].path != "/activity-service/activity/11" {
+		t.Fatalf("calls = %+v; want exactly the bare activity path", api.calls)
+	}
+	raw, err := db.Get("activity_detail", "11")
+	if err != nil {
+		t.Fatalf("stored detail: %v", err)
+	}
+	// The whole document, not the $.activity projection the generated
+	// dependent scopes to: the sibling keys are the reason to fetch detail.
+	for _, key := range []string{"activityId", "summaryDTO", "metadataDTO"} {
+		if _, ok := jsonChild(raw, key); !ok {
+			t.Fatalf("stored detail lost %q", key)
+		}
+	}
+	if _, ok := jsonChild(raw, "garminWrappedBy"); ok {
+		t.Fatal("an object response must be archived unwrapped")
+	}
+}
+
+func TestWalkPerParent_ActivityDetailRejectsANonObjectResponse(t *testing.T) {
+	db := testStore(t)
+	if err := db.Upsert("activities", "12", json.RawMessage(`{"activityId":12}`)); err != nil {
+		t.Fatalf("seed activity: %v", err)
+	}
+	api := &fakeGarmin{respond: func(fakeCall, int) (json.RawMessage, error) {
+		return json.RawMessage(`[1,2,3]`), nil
+	}}
+	var buf strings.Builder
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{now: fixedClock("2026-09-08")})
+	w.emit = &garminEmitter{w: &buf, machine: true}
+	out := w.walkSeries(context.Background(), seriesNamed(t, "activity_detail"))
+	if out.errored {
+		t.Fatalf("an unexpected shape must warn, not error: %v", out.err)
+	}
+	if !strings.Contains(buf.String(), "per_parent_shape_unrecognized") {
+		t.Fatalf("events did not report the shape: %s", buf.String())
+	}
+	// UpsertKeyedBatch would have skipped it anyway; the point is that the
+	// walk says so rather than reporting a silent zero.
+	if n, err := db.CountResourceRows("activity_detail"); err != nil || n != 0 {
+		t.Fatalf("rows=%d err=%v; a non-object response must not be archived", n, err)
+	}
+}
+
+func TestWalkPerParent_ActivitySplitsAreKeyedByTheirActivity(t *testing.T) {
+	db := testStore(t)
+	for _, id := range []string{"21", "22"} {
+		if err := db.Upsert("activities", id, json.RawMessage(`{"activityId":`+id+`}`)); err != nil {
+			t.Fatalf("seed activity: %v", err)
+		}
+	}
+	api := &fakeGarmin{respond: func(c fakeCall, _ int) (json.RawMessage, error) {
+		if !strings.HasSuffix(c.path, "/splits") {
+			t.Fatalf("unexpected path %s", c.path)
+		}
+		return json.RawMessage(`{"lapDTOs":[{"lapIndex":1}]}`), nil
+	}}
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{now: fixedClock("2026-09-08")})
+	out := w.walkSeries(context.Background(), seriesNamed(t, "activity_splits"))
+	if out.errored {
+		t.Fatalf("splits fan-out errored: %v", out.err)
+	}
+	if out.stored != 2 {
+		t.Fatalf("stored %d split rows, want 2", out.stored)
+	}
+	// The wrapper is what keys the row to its parent. Live 2026-09-13 the
+	// real body does carry an activityId, but the spec declares the response
+	// only as a FreeFormObject, so the walker never reads one out of it.
+	raw, err := db.Get("activity_splits", "21")
+	if err != nil {
+		t.Fatalf("stored splits: %v", err)
+	}
+	if got := jsonStringField(raw, "activityId"); got != "21" {
+		t.Fatalf("stored payload activityId = %q, want 21", got)
+	}
+	if _, ok := jsonChild(raw, "splits"); !ok {
+		t.Fatal("stored payload lost the splits body")
+	}
+
+	// A re-run asks for nothing: both activities already have a row.
+	before := len(api.calls)
+	again := w.walkSeries(context.Background(), seriesNamed(t, "activity_splits"))
+	if again.errored {
+		t.Fatalf("re-run errored: %v", again.err)
+	}
+	if len(api.calls) != before {
+		t.Fatalf("re-run made %d extra calls; stored parents must be skipped", len(api.calls)-before)
+	}
+}
+
+// When --max-dependents binds, the progress window has to report what is
+// still outstanding rather than the cap itself: a window that always equals
+// the cap tells an operator nothing about how much archive is left.
+func TestWalkPerParent_ProgressWindowReportsTheUncappedRemainder(t *testing.T) {
+	db := testStore(t)
+	for _, id := range []string{"31", "32", "33"} {
+		if err := db.Upsert("activities", id, json.RawMessage(`{"activityId":`+id+`}`)); err != nil {
+			t.Fatalf("seed activity: %v", err)
+		}
+	}
+	api := &fakeGarmin{respond: func(fakeCall, int) (json.RawMessage, error) {
+		return json.RawMessage(`{"activityId":31,"summaryDTO":{"distance":5000}}`), nil
+	}}
+	var buf strings.Builder
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{maxDependents: 1, now: fixedClock("2026-09-08")})
+	w.emit = &garminEmitter{w: &buf, machine: true}
+	out := w.walkSeries(context.Background(), seriesNamed(t, "activity_detail"))
+	if out.errored {
+		t.Fatalf("capped fan-out errored: %v", out.err)
+	}
+	if out.stored != 1 {
+		t.Fatalf("stored %d rows, want 1: the cap is 1", out.stored)
+	}
+	// 3 parents, 1 fetched, so 2 are still missing. Reporting the truncated
+	// slice would print "1 pending" however large the real backlog is.
+	if !strings.Contains(buf.String(), `"window":"2 pending"`) {
+		t.Fatalf("progress window did not report the true remainder: %s", buf.String())
+	}
+}
+
+func TestWalkSingleDocument_HRZoneConfigKeepsExactlyOneRow(t *testing.T) {
+	db := testStore(t)
+	api := &fakeGarmin{respond: func(c fakeCall, n int) (json.RawMessage, error) {
+		if c.path != "/biometric-service/heartRateZones" {
+			t.Fatalf("unexpected path %s", c.path)
+		}
+		return json.RawMessage(fmt.Sprintf(`[{"sport":"DEFAULT","zone1Floor":%d.0}]`, 90+n)), nil
+	}}
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{now: fixedClock("2026-09-08")})
+	out := w.walkSeries(context.Background(), seriesNamed(t, "hr_zone_config"))
+	if out.errored {
+		t.Fatalf("single-document walk errored: %v", out.err)
+	}
+	if out.stored != 1 {
+		t.Fatalf("stored %d rows, want 1", out.stored)
+	}
+	// A bare array is not a document the store will accept and carries no
+	// id, so it is wrapped under one fixed key.
+	raw, err := db.Get("hr_zone_config", garminHRZoneConfigID)
+	if err != nil {
+		t.Fatalf("stored zone config: %v", err)
+	}
+	if _, ok := jsonChild(raw, "heartRateZones"); !ok {
+		t.Fatalf("stored payload lost the heartRateZones body: %s", raw)
+	}
+
+	// Re-running replaces the row rather than adding a dated second copy:
+	// this series is the account's current settings, not a time series.
+	second := w.walkSeries(context.Background(), seriesNamed(t, "hr_zone_config"))
+	if second.errored {
+		t.Fatalf("second run errored: %v", second.err)
+	}
+	if n, err := db.CountResourceRows("hr_zone_config"); err != nil || n != 1 {
+		t.Fatalf("rows=%d err=%v after two runs, want exactly 1", n, err)
+	}
+	// The count this series publishes is mirrored into the generated
+	// sync_state that doctor and tail read, so it has to be the row count
+	// rather than the number of runs.
+	st, err := db.GetGarminSeriesState("hr_zone_config")
+	if err != nil {
+		t.Fatalf("series state: %v", err)
+	}
+	if st.TotalRows != 1 {
+		t.Fatalf("total_rows = %d after two runs over a one-row table; the mirrored count would tell doctor there are %d rows", st.TotalRows, st.TotalRows)
+	}
+	if len(api.calls) != 2 {
+		t.Fatalf("made %d calls over two runs; the document is re-fetched every run", len(api.calls))
+	}
+}
+
 func TestWalkActivityHRZones_EmptyParentTableWarnsRatherThanFailing(t *testing.T) {
 	db := testStore(t)
 	api := &fakeGarmin{respond: func(fakeCall, int) (json.RawMessage, error) {
@@ -803,6 +986,28 @@ func TestSeriesCatalog_IsInternallyConsistent(t *testing.T) {
 			if s.dayReq == nil || s.extract == nil {
 				t.Fatalf("per-day series %q is missing a request or extract function", s.name)
 			}
+		case seriesOffsetPaged:
+			// The activity feed builds its own request and extraction
+			// inside walkActivities, so there is nothing per-series here.
+		case seriesPerParent:
+			if s.parentResource == "" || s.parentNoun == "" || s.childReq == nil || s.wrapChild == nil {
+				t.Fatalf("per-parent series %q is missing a parent, a request or a wrapper", s.name)
+			}
+		case seriesSingleDocument:
+			if s.docReq == nil || s.docID == "" || s.wrapDoc == nil {
+				t.Fatalf("single-document series %q is missing a request, an id or a wrapper", s.name)
+			}
+		default:
+			t.Fatalf("series %q has a kind no catalog check covers", s.name)
+		}
+		// A kind the plan or the reporting vocabulary does not know about
+		// reaches the user as "unknown" or as a silent zero-cost entry.
+		if kindName(s.kind) == "unknown" {
+			t.Fatalf("series %q has a kind kindName does not name", s.name)
+		}
+		planned := planGarminForwardWork([]garminSeries{s}, mustParseCivilDay("2026-09-08"), 28)[0]
+		if planned.Requests == 0 && planned.Note == "" {
+			t.Fatalf("series %q plans as zero requests with no note; planGarminForwardWork has no case for its kind", s.name)
 		}
 	}
 	if len(garminSeriesNames()) != len(garminSeriesCatalog()) {

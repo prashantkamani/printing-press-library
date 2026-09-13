@@ -124,8 +124,8 @@
         "comment": "Walks the date-ranged daily-stats series backwards into the local archive; the first run backfills, later runs resume."
       },
       {
-        "command": "garmin-pp-cli sync",
-        "comment": "Refreshes the activities feed and its per-activity detail; it does not walk the windowed daily-stats series, so history still owns that job."
+        "command": "garmin-pp-cli history --series activity_detail,activity_splits,hr_zone_config",
+        "comment": "Fills the per-activity detail, splits and heart-rate-zone configuration that `sync` used to fetch; `sync` itself is superseded and only points back here."
       },
       {
         "command": "garmin-pp-cli sleep stats --start 2026-08-01 --end 2026-08-28",
@@ -143,14 +143,18 @@
       },
       {
         "symptom": "A range longer than 28 days returns fewer rows than expected.",
-        "fix": "Garmin caps daily-stats requests at 28 calendar days. Use `history` and query the local archive instead of asking one endpoint for a long range; `sync` alone does not walk this series."
+        "fix": "Garmin caps daily-stats requests at 28 calendar days. Use `history` and query the local archive instead of asking one endpoint for a long range; `history` is the only command that walks this series."
+      },
+      {
+        "symptom": "`sync` prints \"sync is superseded by history\" and exits 2.",
+        "fix": "`history` is the only command that fills the archive; `sync` is a dead end and prints a pointer to it. See \"Why `sync` is a dead-end\" in the README for the full reason."
       },
       {
         "symptom": "Commands read the wrong person's data on a shared machine.",
         "fix": "Set GARMIN_HOME (or pass --home) per account; `doctor --json` prints which home directory each kind resolved to and why."
       }
     ],
-    "when_to_use": "Reach for this CLI for any question about the owner's Garmin Connect history: sleep trends, training status and readiness, VO2 max, resting heart rate, step and intensity-minute trends, heart-rate zones, and the activity feed. It is at its best on questions that span months or years, because those are answered from the local archive rather than from Garmin's 28-day pages. Run `history` first to fill the daily-stats archive, then `sync` when you want the generated activity detail refreshed, then query.",
+    "when_to_use": "Reach for this CLI for any question about the owner's Garmin Connect history: sleep trends, training status and readiness, VO2 max, resting heart rate, step and intensity-minute trends, heart-rate zones, and the activity feed. It is at its best on questions that span months or years, because those are answered from the local archive rather than from Garmin's 28-day pages. Run `history` to fill the archive, then query it. `history` is the only command that fills the archive: `sync` is superseded and prints a pointer to `history`.",
     "anti_triggers": [
       "Do not use it to write anything to Garmin Connect: every command is read-only.",
       "Do not use it for another person's Garmin account without their own login in their own home.",

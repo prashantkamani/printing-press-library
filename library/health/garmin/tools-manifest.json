@@ -464,7 +464,7 @@
     },
     {
       "name": "sleep_stats",
-      "description": "One row per night between `start` and `end`, aggregated by Garmin. At most 28 calendar days per request; longer ranges are walked in 28-day windows by `sync` and de-duplicated on the calendar date. Rows arrive under `individualStats`. Required: start, end. Optional: DI-Backend (default: connectapi.garmin.com). Returns array of SleepStatsDay.",
+      "description": "One row per night between `start` and `end`, aggregated by Garmin. At most 28 calendar days per request; `history` walks longer ranges backwards in 28-day windows into the local archive and de-duplicates on the calendar date. Rows arrive under `individualStats`. Required: start, end. Optional: DI-Backend (default: connectapi.garmin.com). Returns array of SleepStatsDay.",
       "method": "GET",
       "path": "/sleep-service/stats/sleep/daily/{start}/{end}",
       "params": [
@@ -492,7 +492,7 @@
     },
     {
       "name": "steps_daily",
-      "description": "One row per calendar date with total steps, the step goal and the distance walked. At most 28 calendar days per request; `sync` walks longer ranges in windows. Required: start, end. Optional: DI-Backend (default: connectapi.garmin.com). Returns array of DailyStepsDay.",
+      "description": "One row per calendar date with total steps, the step goal and the distance walked. At most 28 calendar days per request; `history` walks longer ranges in 28-day windows into the local archive. Required: start, end. Optional: DI-Backend (default: connectapi.garmin.com). Returns array of DailyStepsDay.",
       "method": "GET",
       "path": "/usersummary-service/stats/steps/daily/{start}/{end}",
       "params": [

@@ -239,7 +239,7 @@ func RegisterTools(s *server.MCPServer) {
 	)
 	s.AddTool(
 		mcplib.NewTool("sleep_stats",
-			mcplib.WithDescription("One row per night between `start` and `end`, aggregated by Garmin. At most 28 calendar days per request; longer ranges are walked in 28-day windows by `sync` and de-duplicated on the calendar date. Rows arrive under `individualStats`. Required: start, end. Optional: DI-Backend (default: connectapi.garmin.com). Returns array of SleepStatsDay."),
+			mcplib.WithDescription("One row per night between `start` and `end`, aggregated by Garmin. At most 28 calendar days per request; `history` walks longer ranges backwards in 28-day windows into the local archive and de-duplicates on the calendar date. Rows arrive under `individualStats`. Required: start, end. Optional: DI-Backend (default: connectapi.garmin.com). Returns array of SleepStatsDay."),
 			mcplib.WithString("DI-Backend", mcplib.Description("Request header used only by Garmin's older cookie-based auth path.")),
 			mcplib.WithString("start", mcplib.Required(), mcplib.Description("Inclusive start date, YYYY-MM-DD.")),
 			mcplib.WithString("end", mcplib.Required(), mcplib.Description("Inclusive end date, YYYY-MM-DD.")),
@@ -251,7 +251,7 @@ func RegisterTools(s *server.MCPServer) {
 	)
 	s.AddTool(
 		mcplib.NewTool("steps_daily",
-			mcplib.WithDescription("One row per calendar date with total steps, the step goal and the distance walked. At most 28 calendar days per request; `sync` walks longer ranges in windows. Required: start, end. Optional: DI-Backend (default: connectapi.garmin.com). Returns array of DailyStepsDay."),
+			mcplib.WithDescription("One row per calendar date with total steps, the step goal and the distance walked. At most 28 calendar days per request; `history` walks longer ranges in 28-day windows into the local archive. Required: start, end. Optional: DI-Backend (default: connectapi.garmin.com). Returns array of DailyStepsDay."),
 			mcplib.WithString("DI-Backend", mcplib.Description("Request header used only by Garmin's older cookie-based auth path.")),
 			mcplib.WithString("start", mcplib.Required(), mcplib.Description("Inclusive start date, YYYY-MM-DD.")),
 			mcplib.WithString("end", mcplib.Required(), mcplib.Description("Inclusive end date, YYYY-MM-DD.")),

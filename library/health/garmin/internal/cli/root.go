@@ -458,7 +458,13 @@ See README.md or the bundled SKILL.md for recipes.`,
 	rootCmd.AddCommand(newWhichCmd(flags))
 	rootCmd.AddCommand(newExportCmd(flags))
 	rootCmd.AddCommand(newSearchCmd(flags))
-	rootCmd.AddCommand(newSyncCmd(flags))
+	// NOVEL: `sync` is a dead end here — the generated newSyncCmd is left
+	// compiled but unregistered and this stub points at `history`, which is
+	// the only command that fills the archive. See
+	// internal/cli/garmin_sync_stub.go and
+	// .printing-press-patches/garmin-sync-superseded.json; a reprint restores
+	// the generated registration and this one line re-applies the override.
+	rootCmd.AddCommand(newGarminSyncStubCmd(flags))
 	// NOVEL: the windowed archive walk. See internal/cli/garmin_sync.go and
 	// .printing-press-patches/garmin-windowed-sync.json.
 	rootCmd.AddCommand(newGarminHistoryCmd(flags))

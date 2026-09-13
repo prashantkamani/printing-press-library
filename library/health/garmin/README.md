@@ -133,8 +133,8 @@ garmin-pp-cli account social-profile
 # Walks the date-ranged daily-stats series backwards into the local archive; the first run backfills, later runs resume.
 garmin-pp-cli history --backfill
 
-# Refreshes the activities feed and its per-activity detail; it does not walk the windowed daily-stats series, so history still owns that job.
-garmin-pp-cli sync
+# Fills the per-activity detail, splits and heart-rate-zone configuration that `sync` used to fetch; `sync` itself is superseded and only points back here.
+garmin-pp-cli history --series activity_detail,activity_splits,hr_zone_config
 
 # A month of nightly sleep summaries straight from Garmin.
 garmin-pp-cli sleep stats --start 2026-08-01 --end 2026-08-28
@@ -242,16 +242,20 @@ Relocation is one-way. Unsetting `GARMIN_HOME` does not move files back to platf
 
 Existing installs keep working because the platform-default rung matches the legacy layout. On the first auth write, stored secrets leave `config.toml` and are consolidated into `credentials.toml` under the data directory. Run `garmin-pp-cli doctor --fail-on warn` to check path and credential-location warnings in automation.
 
+## Why `sync` is a dead-end
+
+`garmin-pp-cli` keeps one local archive and `history` is the only command that fills it. The generated `sync` exists because CLI Printing Press emits it with every SQLite store, and for Garmin it can only do three things: page a flat list, add a `since=` filter that the list endpoint declares, and walk rows of a parent table into a child URL. Garmin's daily statistics sit behind date-range endpoints whose URL carries the range and which refuse more than 28 days per call, or behind per-day endpoints that answer for one date. Neither fits those shapes, so the calendar walk, its per-series resume state and the empty-window stop rule live in `history`. Running one account through both verbs stored the activity feed and the per-activity heart-rate zones twice under different names, and re-paged the whole activity feed on every `sync`, because Garmin's activity list declares no filter the generator recognises. `history` therefore also carries the three fetches only `sync` used to make (activity detail, splits, heart-rate-zone configuration), and `sync` prints a pointer to `history` and exits. Generated messages that say "run `garmin-pp-cli sync` first" still lead to the right place.
+
 ## Commands
 
 The novel `history` verb walks the date-ranged daily-stats series backwards into the local archive
 and resumes where it stopped — 28-day windows where Garmin caps a request at 28 days (sleep stats,
 sleep score, steps), 364-day windows where it does not (resting HR, VO2 max, intensity minutes), and
 one request per day for the per-day series (daily summary, sleep detail, daily HR, training
-readiness), bounded by `--days`. The generated `sync` verb covers the activities feed and its
-per-activity detail (activity, HR zones, splits) — the flat resources the press can enumerate — and
-cannot walk those windows itself. `history` is the command that keeps the archive current; run
-`sync` when you want the generated activity detail refreshed on its own.
+readiness), bounded by `--days`. It also pages the activity feed and fans out over it for the
+per-activity fetches (detail, splits, HR zones), and keeps the account's heart-rate-zone
+configuration. `history` is the only command that fills the archive; the generated `sync` verb is
+superseded and prints a pointer to `history`.
 
 ### account
 
@@ -332,8 +336,7 @@ than fetching per-night detail when the question is about a trend rather than on
 28 calendar days per request.
 - **`garmin-pp-cli sleep stats`** - One row per night between `start` and `end`, aggregated by Garmin. At most 28 calendar days per
 request; `history` walks longer ranges backwards in 28-day windows into the local archive and
-de-duplicates on the calendar date. The generated `sync` verb does not chunk this series. Rows
-arrive under `individualStats`.
+de-duplicates on the calendar date. Rows arrive under `individualStats`.
 
 ### steps
 
@@ -341,7 +344,6 @@ Daily and weekly step totals against the account's goal.
 
 - **`garmin-pp-cli steps daily`** - One row per calendar date with total steps, the step goal and the distance walked. At most 28
 calendar days per request; `history` walks longer ranges in 28-day windows into the local archive.
-The generated `sync` verb does not chunk this series.
 - **`garmin-pp-cli steps weekly`** - Weekly step buckets instead of daily ones, which covers about a year in a single request where
 the daily form would take thirteen. Use it for long-horizon trend questions and fall back to the
 daily form when a specific date matters.
@@ -463,7 +465,8 @@ If you use agentcookie to sync secrets across machines, this CLI auto-adopts age
 ### API-specific
 - **`auth login` reports that the signed-in account does not match --email.** — Another Garmin session owned the browser. Sign out of Garmin in the browser, then run `auth login` again; nothing was written to your home.
 - **Every wellness series comes back empty while activities are present.** — The account has no wearable paired. Bike computers and trainers record activities but no sleep, heart-rate or body-battery series; check `daily-summary` for `includesWellnessData` before assuming a bug.
-- **A range longer than 28 days returns fewer rows than expected.** — Garmin caps daily-stats requests at 28 calendar days. Use `history` and query the local archive instead of asking one endpoint for a long range; `sync` alone does not walk this series.
+- **A range longer than 28 days returns fewer rows than expected.** — Garmin caps daily-stats requests at 28 calendar days. Use `history` and query the local archive instead of asking one endpoint for a long range; `history` is the only command that walks this series.
+- **`sync` prints "sync is superseded by history" and exits 2.** — `history` is the only command that fills the archive; `sync` is a dead end and prints a pointer to it. See "Why `sync` is a dead-end" in the README for the full reason.
 - **Commands read the wrong person's data on a shared machine.** — Set GARMIN_HOME (or pass --home) per account; `doctor --json` prints which home directory each kind resolved to and why.
 
 ## Sources & Inspiration

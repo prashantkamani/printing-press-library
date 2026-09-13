@@ -41,7 +41,7 @@ Garmin Connect caps every daily-stats request at 28 days and offers no personal 
 
 ## When to Use This CLI
 
-Reach for this CLI for any question about the owner's Garmin Connect history: sleep trends, training status and readiness, VO2 max, resting heart rate, step and intensity-minute trends, heart-rate zones, and the activity feed. It is at its best on questions that span months or years, because those are answered from the local archive rather than from Garmin's 28-day pages. Run `history` first to fill the daily-stats archive, then `sync` when you want the generated activity detail refreshed, then query.
+Reach for this CLI for any question about the owner's Garmin Connect history: sleep trends, training status and readiness, VO2 max, resting heart rate, step and intensity-minute trends, heart-rate zones, and the activity feed. It is at its best on questions that span months or years, because those are answered from the local archive rather than from Garmin's 28-day pages. Run `history` to fill the archive, then query it. `history` is the only command that fills the archive: `sync` is superseded and prints a pointer to `history`.
 
 ## Anti-triggers
 
@@ -79,10 +79,10 @@ The novel `history` verb walks the date-ranged daily-stats series backwards into
 and resumes where it stopped — 28-day windows where Garmin caps a request at 28 days (sleep stats,
 sleep score, steps), 364-day windows where it does not (resting HR, VO2 max, intensity minutes), and
 one request per day for the per-day series (daily summary, sleep detail, daily HR, training
-readiness), bounded by `--days`. The generated `sync` verb covers the activities feed and its
-per-activity detail (activity, HR zones, splits) — the flat resources the press can enumerate — and
-cannot walk those windows itself. `history` is the command that keeps the archive current; run
-`sync` when you want the generated activity detail refreshed on its own.
+readiness), bounded by `--days`. It also pages the activity feed and fans out over it for the
+per-activity fetches (detail, splits, HR zones), and keeps the account's heart-rate-zone
+configuration. `history` is the only command that fills the archive; the generated `sync` verb is
+superseded and prints a pointer to `history`.
 
 **account** — Bootstrap and identity: social profile, unit settings, and the account email a login is checked against.
 
