@@ -7,11 +7,11 @@
   "cli_name": "garmin-pp-cli",
   "creator": {
     "handle": "prashantkamani",
-    "name": "Aria Kamani"
+    "name": "Prashant Kamani"
   },
   "owner": "prashantkamani",
   "printer": "prashantkamani",
-  "printer_name": "Aria Kamani",
+  "printer_name": "Prashant Kamani",
   "spec_path": "spec.yaml",
   "spec_format": "openapi3",
   "spec_checksum": "sha256:dccb674343e4729da2772627983108f8c7719410aad5b7ddd1d90e5908bd59f3",
@@ -45,14 +45,25 @@
   "auth_key_url": "https://sso.garmin.com/portal/sso/en-US/sign-in",
   "novel_features": [
     {
-      "name": "Loopback browser login with identity assertion",
-      "command": "auth login",
-      "description": "Signs in through Garmin's own page in your browser, catches the redirect on a loopback port, and refuses to store a token whose account email does not match the one you named."
+      "name": "Sleep over a window, joined and compared",
+      "command": "insights sleep",
+      "description": "Duration, score, stage split and resting heart rate for a window of nights, with the equally long window before it beside them."
+    },
+    {
+      "name": "Training load, zone split and fitness trend in one read",
+      "command": "insights training",
+      "description": "Archived activities grouped by type with their time and distance, time summed per heart-rate zone, weekly load buckets, and the VO2-max and readiness trends beside them."
     },
     {
       "name": "Oldest-first archive fill of the 28-day-capped series",
       "command": "history",
-      "description": "Fills a local SQLite archive from the oldest day forward, one bookmark per series, so an interrupted run continues where it stopped — 28-day windows where Garmin caps a request at 28 days, 364-day windows where it does not, and one request per day for the per-day series, asked only for days something was recorded."
+      "description": "Fills a local SQLite archive of every Garmin daily series from the oldest day forward, keeping one bookmark per series so an interrupted run resumes instead of restarting."
+    },
+    {
+      "name": "Loopback browser login with identity assertion",
+      "command": "auth login",
+      "description": "Refuses to store a token whose account is not the address you named, so a shared browser cannot sign the wrong household member in."
     }
-  ]
+  ],
+  "owner_name": "Prashant Kamani"
 }

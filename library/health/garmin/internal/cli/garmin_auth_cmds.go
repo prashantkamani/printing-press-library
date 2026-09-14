@@ -1,4 +1,4 @@
-// Copyright 2026 Aria Kamani and contributors. Licensed under Apache-2.0. See LICENSE.
+// Copyright 2026 Prashant Kamani and contributors. Licensed under Apache-2.0. See LICENSE.
 //
 // Wiring for the hand-authored Garmin auth flow: it replaces the generated
 // `auth setup` and `auth status` prose (which describes pasting an API token

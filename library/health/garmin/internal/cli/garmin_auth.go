@@ -1,4 +1,4 @@
-// Copyright 2026 Aria Kamani and contributors. Licensed under Apache-2.0. See LICENSE.
+// Copyright 2026 Prashant Kamani and contributors. Licensed under Apache-2.0. See LICENSE.
 //
 // Hand-authored Garmin auth flow. This file carries NO generator header on
 // purpose: `cli-printing-press generate --force` rewrites only its own

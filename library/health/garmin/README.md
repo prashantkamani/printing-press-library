@@ -2,9 +2,9 @@
 
 **Your whole Garmin history in a local database, not one 28-day page at a time.**
 
-Garmin Connect caps every daily-stats request at 28 days and offers no personal API token, which is why the ecosystem is a handful of Python libraries rather than a tool you can call. This CLI signs in through your own browser, keeps each account's tokens in its own home, fills the whole history into SQLite oldest day first — interrupt it and the next run continues where it stopped — and answers sleep, training, heart-rate and activity questions from the archive with JSON on stdout.
+Garmin Connect caps every daily-stats request at 28 calendar days and issues no personal API token, which is why its ecosystem is a handful of Python libraries rather than a tool an agent can call. `history` walks the whole account into a local SQLite archive, oldest day first, and `insights sleep` and `insights training` answer months-long sleep, training-load and heart-rate-zone questions from that archive with JSON on stdout. `auth login` keeps each household account in its own home and refuses to store a token that belongs to somebody else.
 
-Created by [@prashantkamani](https://github.com/prashantkamani) (Aria Kamani).
+Created by [@prashantkamani](https://github.com/prashantkamani) (Prashant Kamani).
 
 ## Install
 
@@ -119,25 +119,25 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 
 ## Authentication
 
-Garmin issues no personal API key. Sign-in goes through Garmin's own page in your browser: `auth login` opens it, catches the redirect back to a loopback port on 127.0.0.1, exchanges the ticket for an access token and a refresh token, and checks the account email on the resulting token against the one you named before writing anything to disk. The password never reaches this CLI, and the refresh token keeps the session alive without another browser visit. A token supplied through GARMIN_ACCESS_TOKEN or GARMIN_TOKEN is used as-is instead: it is never refreshed, it is not this home's stored chain, and plain `auth status` reports it as not this home's asserted account (run `auth status --verify` to have Garmin confirm which account that token belongs to). One Garmin account per home. To connect a second household account, in this order: sign out of Garmin in the browser; run the login under that account's own home with `GARMIN_HOME=~/.local/share/garmin-homes/other garmin-pp-cli auth login --email other@example.com`; confirm the account email the login prints is the one you meant; sign out of Garmin in the browser again. Clearing browser cookies is never required, and this CLI never attempts it — those sign-outs are ordinary sign-outs on Garmin's own site, so the choreography works for a user with no file-system access to the browser profile. Check which account a home holds with `garmin-pp-cli auth status` (add `--verify` to confirm it with one call to Garmin), and clear a home's stored chain with `garmin-pp-cli auth logout`.
+Garmin issues no personal API key, so `garmin-pp-cli auth login --email you@example.com` is the way in: it signs the browser out of Garmin, opens Garmin's own sign-in page, catches the one-time ticket on a loopback port on 127.0.0.1, and then asks Garmin which account it just authenticated. If that is not the address you passed, nothing is written to disk. Your password never reaches this CLI, and the refresh token keeps the session alive afterwards without another browser visit. A token supplied in GARMIN_ACCESS_TOKEN or GARMIN_TOKEN is used as-is instead: never refreshed, and not this home's stored chain. One Garmin account per home; `auth status --verify` asks Garmin which one this home holds. `garmin-pp-cli auth logout` clears that home's stored chain.
 
 ## Quick Start
 
 ```bash
-# One browser sign-in; the email you pass is checked against the account that actually signed in.
-garmin-pp-cli auth login --email you@example.com
+# Health check first: it names the directory every path kind resolved to and whether this home has credentials.
+garmin-pp-cli doctor
 
-# Confirms the token works and prints the displayName the rest of the commands need.
-garmin-pp-cli account social-profile
-
-# Fills the local archive: every series oldest day first, with one bookmark each, the per-activity fetches starting from the same day. It prints what the expensive part will cost before it starts, and interrupting it is safe.
-garmin-pp-cli history --since all
-
-# What each series already holds, how far it is filled, and how many requests it still owes. Makes no request.
+# What each series already holds and what it still owes. It makes no request, so it is safe before anything is filled.
 garmin-pp-cli history --status
 
-# A month of nightly sleep summaries straight from Garmin.
-garmin-pp-cli sleep stats --start 2026-08-01 --end 2026-08-28
+# Do this once. It is the only command that fills the archive, and everything below reads the archive rather than the API.
+garmin-pp-cli history --since all
+
+# The first archive question: four weeks of sleep with the four weeks before them alongside.
+garmin-pp-cli insights sleep --days 28 --agent
+
+# The same window for activities: totals by type, time in heart-rate zone and weekly load.
+garmin-pp-cli insights training --days 28 --agent
 
 ```
 
@@ -145,22 +145,38 @@ garmin-pp-cli sleep stats --start 2026-08-01 --end 2026-08-28
 
 These capabilities aren't available in any other tool for this API.
 
-### Auth you can trust with a household
-- **`auth login`** — Signs in through Garmin's own page in your browser, catches the redirect on a loopback port, and refuses to store a token whose account email does not match the one you named.
+### Questions answered from the archive
+- **`insights sleep`** — Duration, score, stage split and resting heart rate for a window of nights, with the equally long window before it beside them.
 
-  _Use this once per Garmin account per home; after it, everything else works unattended from the refresh token._
+  _Pick this over per-night endpoint calls whenever the question spans more than a few nights: one local read replaces one request per night, and nights the watch did not measure are counted as missing rather than as zero._
 
   ```bash
-  garmin-pp-cli auth login --email you@example.com
+  garmin-pp-cli insights sleep --days 90 --agent --select period,coverage.nights_with_stats,duration_minutes.avg,score.avg
+  ```
+- **`insights training`** — Archived activities grouped by type with their time and distance, time summed per heart-rate zone, weekly load buckets, and the VO2-max and readiness trends beside them.
+
+  _Pick this over the activity feed when the question is about volume, intensity or balance rather than one workout; it reports how many activities had zones archived so a strapless ride is not read as easy training._
+
+  ```bash
+  garmin-pp-cli insights training --days 28 --agent --select totals,by_type.type,by_type.duration_minutes,hr_zones
   ```
 
 ### Local state that compounds
-- **`history`** — Fills a local SQLite archive from the oldest day forward, one bookmark per series, so an interrupted run continues where it stopped — 28-day windows where Garmin caps a request at 28 days, 364-day windows where it does not, and one request per day for the per-day series, asked only for days something was recorded.
+- **`history`** — Fills a local SQLite archive of every Garmin daily series from the oldest day forward, keeping one bookmark per series so an interrupted run resumes instead of restarting.
 
-  _Run this before any trend question; every analytics command reads the archive, not the API._
+  _Run this before any question that reaches past the last 28 days: `--since all` or `--since YYYY-MM-DD` is the only depth control it offers, `--status` reports what each series still owes, and every insights command reads the archive rather than the API._
 
   ```bash
-  garmin-pp-cli history --since all --dry-run
+  garmin-pp-cli history --since all
+  ```
+
+### Auth you can trust with a household
+- **`auth login`** — Refuses to store a token whose account is not the address you named, so a shared browser cannot sign the wrong household member in.
+
+  _Run this once per Garmin account per home before anything else; afterwards every command works unattended from the refresh token._
+
+  ```bash
+  garmin-pp-cli auth login --email you@example.com
   ```
 
 ## Recipes
@@ -171,43 +187,39 @@ These capabilities aren't available in any other tool for this API.
 garmin-pp-cli history --dry-run
 ```
 
-The daily statistics start at 2007-01-01, the oldest day Garmin answers for, whatever the account's age: the years before the account existed cost one request per window and store nothing. The activity feed starts at the account's first activity. The per-day series ask only for days a cheaper series or an activity already shows a reading for, and the per-activity fetches — detail, splits and heart-rate zones — cover only activities that start on or after the day the run starts from.
+The dry run prints the same estimate the real run prints before its expensive half, and makes no request at all, so read it before committing to the fill. What it is counting: the daily series start at 2007-01-01, the oldest day Garmin answers for whatever the account's age, and the activity feed starts at the account's first activity; one request covers a 28-day or 364-day window of a daily series, one activity for each of the three per-activity fetches, or one signal day for each of the four per-day series, and each request takes about 0.4 s. An account worn daily for years comes to several thousand requests, about an hour, and a few hundred MB on disk; a sparse account is about a thousand requests and under ten minutes. The per-activity fetches — detail, splits and heart-rate zones — cover only the activities that start on or after the day the run starts from, so a later, deeper `--since` extends them downward along with the daily series. When the estimate reads acceptable, start the fill with `garmin-pp-cli history --since all`.
 
-One request covers a 28-day or 364-day window of a daily series, one activity for each of the three per-activity fetches, or one signal day for each of the four per-day series. Each request takes about 0.4 s — a fixed pause plus Garmin's answer. A first fill of an account worn daily for years is several thousand requests, about an hour and a few hundred MB on disk; a sparse account is about a thousand requests and under ten minutes.
-
-`history --dry-run` prints the same estimate line the real run prints before its expensive half, and makes no request at all. `--since YYYY-MM-DD` starts there instead and can be deepened later without re-fetching what is already stored. Interrupting a run is safe: run it again and it picks up whatever is still missing.
-
-### First fill, and what to do if it stops
+### A quarter of sleep, narrowed to the numbers that answer the question
 
 ```bash
-garmin-pp-cli history --since all
+garmin-pp-cli insights sleep --days 90 --agent --select period,coverage.nights_with_stats,duration_minutes.avg,score.avg,trend_vs_prior_period.duration_minutes.delta_pct
 ```
 
-Fills every series from the oldest day it can reach. Before the expensive per-activity and per-day fetches it prints what they will cost in requests, time and disk — `--dry-run` prints the same thing without fetching anything. Interrupting is safe: run it again and it continues where it stopped. For a shallower fill, `--since 2026-01-01` starts there instead, and a later deeper `--since` extends the archive downward without re-fetching what is already stored.
+Ninety nights come out of the archive in one local read; `--select` keeps five numbers instead of the full nightly payload, and `coverage.nights_with_stats` says how many nights actually fed the averages.
 
-### Four weeks of sleep score in one call
+### Four weeks of training load and the zone split behind it
 
 ```bash
-garmin-pp-cli sleep score-stats --start 2026-08-10 --end 2026-09-06
+garmin-pp-cli insights training --days 28 --agent --select totals,by_type.type,by_type.duration_minutes,hr_zones
 ```
 
-The score trend is server-aggregated, so a month costs one request instead of twenty-eight per-night calls.
+Totals, a per-type breakdown and the heart-rate-zone split in one read; drop the `--select` to also see `coverage.activities_with_zones`, which is how many of those activities were recorded with a strap.
 
-### What this account actually does
+### Count the archive by any stored field
 
 ```bash
-garmin-pp-cli activities breakdown --aggregation lifetime --metric duration
+garmin-pp-cli analytics --type activities --group-by activityName --limit 10 --agent
 ```
 
-Lifetime totals grouped by activity type, computed by Garmin, without paging the activity list.
+`analytics` counts rows of any archived resource type, grouped by one top-level field of the stored JSON — `activities`, `sleep_stats`, `steps`, `training_readiness` and the other series `history` fills. Activity names are free text, so this grouping shows which workouts the account repeats under the same name rather than a tidy per-type histogram, and nested fields such as `activityType.typeKey` are out of reach because the grouping resolves top-level keys only. `search <text> --type activities --data-source local` is the full-text equivalent over the same rows.
 
-### Time in zone for the last ride
+### Connect a second household account
 
 ```bash
-garmin-pp-cli activities list --limit 1 --json | jq -r '.[0].activityId' | xargs garmin-pp-cli activities hr-time-in-zones
+garmin-pp-cli auth login --email other@example.com --home ~/.local/share/garmin-homes/other
 ```
 
-Zone seconds for one activity; pair it with `heart-rate zones` to label the zones.
+The second account gets its own home: `--home` for a single invocation, GARMIN_HOME to make it durable for a session.
 
 ## Usage
 
@@ -268,24 +280,6 @@ Existing installs keep working because the platform-default rung matches the leg
 
 ## Commands
 
-The novel `history` verb fills the local archive from the oldest day forward and keeps one bookmark
-per series, so an interrupted run continues where it stopped — 28-day windows where Garmin caps a
-request at 28 days (sleep stats, sleep score, steps), 364-day windows where it does not (resting HR,
-VO2 max, intensity minutes), and one request per day for the per-day series (daily summary, sleep
-detail, daily HR, training readiness), asked only for the days a cheaper series already shows a
-reading for. It also pages the activity feed and fans out over it for the per-activity fetches
-(detail, splits, HR zones), which cover the activities that start on or after the day the run
-starts from, and keeps the account's heart-rate-zone configuration.
-
-How far back to go is the only choice it offers: `--since all` for everything the account holds,
-`--since YYYY-MM-DD` to start there, and neither to keep the depth the archive already has and catch
-up to today. A later, deeper `--since` extends the archive downward without re-fetching the range
-already filled, the per-activity fetches with it. Before the per-activity and per-day fetches — the
-expensive half of a run — it prints what they will cost in requests, time and disk; `--dry-run`
-prints the same thing without fetching anything, and `--status` reports what each series already
-holds and still owes. `history` is the only command that fills the archive; the generated `sync`
-verb is superseded and prints a pointer to `history`.
-
 ### account
 
 Bootstrap and identity: social profile, unit settings, and the account email a login is checked against.
@@ -312,11 +306,11 @@ request instead of paging the whole activity list.
 - **`garmin-pp-cli activities download-original`** - Fetches the original recorded file for one activity as a ZIP containing the device FIT file.
 This is the sanctioned export route for raw per-second data that the JSON endpoints do not
 expose. Binary response; write it to a file rather than parsing it.
-- **`garmin-pp-cli activities get`** - Everything Garmin holds about a single activity at summary level: type, timing, distance,
-elevation, aggregate heart rate and power. Take the id from the activity list.
-- **`garmin-pp-cli activities hr-time-in-zones`** - Seconds spent in each configured heart-rate zone during one activity, which is the raw material
-for a training-polarisation ratio across a season. Combine with the zone settings to label the
-zones.
+- **`garmin-pp-cli activities get`** - Everything Garmin holds about one activity at summary level: type, timing, distance and elevation.
+Aggregate heart rate and power come with it. Take the id from the activity list.
+- **`garmin-pp-cli activities hr-time-in-zones`** - Seconds spent in each configured heart-rate zone during one activity.
+That is the raw material for a training-polarisation ratio across a season. Combine with the zone
+settings to label the zones.
 - **`garmin-pp-cli activities list`** - The account's activity feed, one row per recorded activity, newest first. Pages with `--offset`
 and `--limit`; an empty page means the end of the account's history. Optional filters narrow by
 date range, activity type and sort order. Distinct local start dates over this list are how
@@ -331,8 +325,8 @@ Fitness level over time: VO2 max, max-met values, and Garmin's fitness-age estim
 - **`garmin-pp-cli fitness age`** - Garmin's fitness-age estimate and the components it was computed from for a single date. There
 is no range form, so a fitness-age trend costs one request per day and is what the local archive
 exists for.
-- **`garmin-pp-cli fitness max-metrics`** - Fitness-level trend: VO2 max (generic and cycling) plus the max-met value Garmin derived, one
-row per date that has a measurement. Days without a qualifying activity are absent rather than
+- **`garmin-pp-cli fitness max-metrics`** - Fitness-level trend: VO2 max, generic and cycling, plus Garmin's max-met value, one row per date.
+Only dates with a measurement appear; days without a qualifying activity are absent rather than
 zero. At most 28 calendar days per request.
 
 ### heart_rate
@@ -342,9 +336,9 @@ Configured heart-rate zones, daily heart-rate detail, and per-activity time in z
 - **`garmin-pp-cli heart-rate daily`** - The intraday heart-rate series for a single date plus the resting, minimum and maximum values
 Garmin derived from it. Sampled values only exist for dates a wearable was worn. This is the
 account-scoped path variant.
-- **`garmin-pp-cli heart-rate daily-alt`** - Identical payload to `daily`, reached on the wellness-service path that takes the date as a
-query parameter and needs no displayName. Kept as a fallback and for use before the bootstrap
-profile call has run.
+- **`garmin-pp-cli heart-rate daily-alt`** - Identical payload to `daily`, on the wellness-service path that takes the date as a query parameter.
+It needs no displayName, so it is kept as a fallback and for use before the bootstrap profile
+call has run.
 - **`garmin-pp-cli heart-rate zones`** - The zone boundaries the account has configured, per sport. These are settings, not measurements:
 read them to label time-in-zone numbers, and expect them to change only when the user edits them
 or Garmin auto-detects a new threshold.
@@ -357,9 +351,9 @@ Sleep score trends, server-aggregated nightly summaries, and full per-night deta
 the sleep-score breakdown. One request per night, so a trend question should use the range
 commands instead. This is the account-scoped path variant; `night-alt` is the same payload
 without the displayName in the path.
-- **`garmin-pp-cli sleep night-alt`** - Identical payload to `night`, reached on the sleep-service path that takes the date as a query
-parameter and needs no displayName. It works before the bootstrap profile call has run, and is
-the fallback if the account-scoped path ever changes.
+- **`garmin-pp-cli sleep night-alt`** - Identical payload to `night`, on the sleep-service path that takes the date as a query parameter.
+It needs no displayName, so it works before the bootstrap profile call has run, and it is the
+fallback if the account-scoped path ever changes.
 - **`garmin-pp-cli sleep score-stats`** - The sleep score trend: one row per calendar date with the score value and qualifier. Cheaper
 than fetching per-night detail when the question is about a trend rather than one night. At most
 28 calendar days per request.
@@ -374,20 +368,20 @@ Daily and weekly step totals against the account's goal.
 - **`garmin-pp-cli steps daily`** - One row per calendar date with total steps, the step goal and the distance walked. At most 28
 calendar days per request; `history` fills longer ranges into the local archive in 28-day
 windows, oldest day first.
-- **`garmin-pp-cli steps weekly`** - Weekly step buckets instead of daily ones, which covers about a year in a single request where
-the daily form would take thirteen. Use it for long-horizon trend questions and fall back to the
-daily form when a specific date matters.
+- **`garmin-pp-cli steps weekly`** - Weekly step buckets instead of daily ones, about a year of them in a single request.
+The daily form would take thirteen requests for the same span. Use this for long-horizon trend
+questions and fall back to the daily form when a specific date matters.
 
 ### training
 
 Training status over a window and the daily training-readiness score.
 
-- **`garmin-pp-cli training readiness`** - Garmin's training-readiness score for a single date, with the sleep, recovery, HRV and
-acute-load inputs it was built from. One request per day; a readiness trend comes from the local
-archive, not from this endpoint.
-- **`garmin-pp-cli training status`** - Training status (productive, maintaining, unproductive, detraining, …) with acute and chronic
-load for the days ending on the given date. Returns a page of days, not a single day; treat the
-end date as the anchor.
+- **`garmin-pp-cli training readiness`** - Garmin's training-readiness score for a single date, with the inputs it was built from.
+Those inputs are sleep, recovery, HRV and acute load. One request per day; a readiness trend
+comes from the local archive, not from this endpoint.
+- **`garmin-pp-cli training status`** - Training status with acute and chronic load, for the days ending on the given date.
+The status values are productive, maintaining, unproductive, detraining and their siblings.
+Returns a page of days, not a single day; treat the end date as the anchor.
 
 ### wellness
 
@@ -398,9 +392,9 @@ stress. Check `includesWellnessData` before reading any wellness field — an ac
 wearable returns the envelope with the series absent, not zeroes.
 - **`garmin-pp-cli wellness hydration`** - Water intake logged for a single date against the day's goal. Only populated for accounts where
 the user logs hydration by hand or from a paired bottle.
-- **`garmin-pp-cli wellness hydration-alt`** - The superset form of the hydration payload: everything the shorter path returns plus the
-activity sweat-loss and goal-adjustment fields. Prefer this variant unless the extra fields are
-unwanted.
+- **`garmin-pp-cli wellness hydration-alt`** - The hydration payload plus the activity sweat-loss and goal-adjustment fields.
+It is a superset of everything the shorter path returns; prefer this variant unless the extra
+fields are unwanted.
 - **`garmin-pp-cli wellness intensity-minutes-weekly`** - Weekly buckets of moderate and vigorous intensity minutes against the account's weekly goal.
 This is the series behind Garmin's 'intensity minutes' badge.
 - **`garmin-pp-cli wellness metrics-daily`** - A single named metric as a daily time series over a date range, selected by the numeric metric
@@ -493,12 +487,13 @@ If you use agentcookie to sync secrets across machines, this CLI auto-adopts age
 - Run the `list` command to see available items
 
 ### API-specific
-- **`auth login` reports that the signed-in account does not match --email.** — Another Garmin session owned the browser. Sign out of Garmin in the browser, then run `auth login` again; nothing was written to your home.
-- **Every wellness series comes back empty while activities are present.** — The account has no wearable paired. Bike computers and trainers record activities but no sleep, heart-rate or body-battery series; check `daily-summary` for `includesWellnessData` before assuming a bug.
-- **A range longer than 28 days returns fewer rows than expected.** — Garmin caps daily-stats requests at 28 calendar days. Use `history` and query the local archive instead of asking one endpoint for a long range; `history` is the only command that walks this series.
-- **`sync` prints "sync is superseded by history" and exits 2.** — `history` is the only command that fills the archive; `sync` is a dead end and prints a pointer to it. See "Why `sync` is a dead-end" in the README for the full reason.
-- **Commands read the wrong person's data on a shared machine.** — Set GARMIN_HOME (or pass --home) per account; `doctor --json` prints which home directory each kind resolved to and why.
-- **A `history` run was interrupted, or stopped partway with a warning.** — Run it again. Each series keeps one bookmark, so the next run continues from where it stopped instead of starting over; `history --status` shows how far each one got.
+- **`auth login` reports that Garmin authenticated an account other than the one passed to `--email`.** — A Garmin session survived the sign-out. Nothing was stored: sign out at sso.garmin.com/sso/logout in the browser, then run the login again.
+- **Every insights number is null or zero and a hint on stderr names `history`.** — The archive holds no rows for that window. Run `garmin-pp-cli history --since all` once, then `garmin-pp-cli history --status` to see how far each series got.
+- **A `history` run stopped partway, or you interrupted it.** — Run it again; `garmin-pp-cli history --status` shows what is still outstanding.
+- **A date range longer than 28 days comes back with fewer rows than were asked for.** — Garmin caps daily-stats requests at 28 calendar days. Ask the archive instead, for example `garmin-pp-cli insights sleep --days 90`.
+- **`sync` prints that it is superseded and exits 2.** — `history` is the only command that fills the archive. Run `garmin-pp-cli history` instead.
+- **Commands read the wrong household member's data on a shared machine.** — Each Garmin account needs its own home. Pass `--home <dir>` or set GARMIN_HOME, then run `garmin-pp-cli doctor --json` to see which directory each path kind resolved to.
+- **Sleep and heart-rate series stay empty while activities fill normally.** — The account has no wearable paired; a bike computer records activities but no wellness series. Check `includesWellnessData` on the daily summary before treating it as a bug.
 
 ## Sources & Inspiration
 

@@ -1,4 +1,4 @@
-// Copyright 2026 Aria Kamani and contributors. Licensed under Apache-2.0. See LICENSE.
+// Copyright 2026 Prashant Kamani and contributors. Licensed under Apache-2.0. See LICENSE.
 //
 // Tests for the hand-authored Garmin auth flow. Nothing here opens a browser
 // or contacts Garmin: every server is an httptest instance on loopback, every

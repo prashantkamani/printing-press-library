@@ -266,9 +266,9 @@ paths:
         - sleep
       summary: Show full sleep detail for one night (path variant without displayName)
       description: |
-        Identical payload to `night`, reached on the sleep-service path that takes the date as a query
-        parameter and needs no displayName. It works before the bootstrap profile call has run, and is
-        the fallback if the account-scoped path ever changes.
+        Identical payload to `night`, on the sleep-service path that takes the date as a query parameter.
+        It needs no displayName, so it works before the bootstrap profile call has run, and it is the
+        fallback if the account-scoped path ever changes.
       parameters:
         - $ref: '#/components/parameters/DIBackend'
         - $ref: '#/components/parameters/DateQuery'
@@ -306,8 +306,8 @@ paths:
         - fitness
       summary: List VO2 max and max-met values for a date range
       description: |
-        Fitness-level trend: VO2 max (generic and cycling) plus the max-met value Garmin derived, one
-        row per date that has a measurement. Days without a qualifying activity are absent rather than
+        Fitness-level trend: VO2 max, generic and cycling, plus Garmin's max-met value, one row per date.
+        Only dates with a measurement appear; days without a qualifying activity are absent rather than
         zero. At most 28 calendar days per request.
       parameters:
         - $ref: '#/components/parameters/DIBackend'
@@ -375,9 +375,9 @@ paths:
         - training
       summary: List daily training status ending on a date
       description: |
-        Training status (productive, maintaining, unproductive, detraining, …) with acute and chronic
-        load for the days ending on the given date. Returns a page of days, not a single day; treat the
-        end date as the anchor.
+        Training status with acute and chronic load, for the days ending on the given date.
+        The status values are productive, maintaining, unproductive, detraining and their siblings.
+        Returns a page of days, not a single day; treat the end date as the anchor.
       parameters:
         - $ref: '#/components/parameters/DIBackend'
         - $ref: '#/components/parameters/EndDate'
@@ -411,9 +411,9 @@ paths:
         - training
       summary: Show the training-readiness score for one date
       description: |
-        Garmin's training-readiness score for a single date, with the sleep, recovery, HRV and
-        acute-load inputs it was built from. One request per day; a readiness trend comes from the local
-        archive, not from this endpoint.
+        Garmin's training-readiness score for a single date, with the inputs it was built from.
+        Those inputs are sleep, recovery, HRV and acute load. One request per day; a readiness trend
+        comes from the local archive, not from this endpoint.
       parameters:
         - $ref: '#/components/parameters/DIBackend'
         - $ref: '#/components/parameters/DatePath'
@@ -622,9 +622,9 @@ paths:
         - steps
       summary: List weekly step aggregates for a number of weeks ending on a date
       description: |
-        Weekly step buckets instead of daily ones, which covers about a year in a single request where
-        the daily form would take thirteen. Use it for long-horizon trend questions and fall back to the
-        daily form when a specific date matters.
+        Weekly step buckets instead of daily ones, about a year of them in a single request.
+        The daily form would take thirteen requests for the same span. Use this for long-horizon trend
+        questions and fall back to the daily form when a specific date matters.
       parameters:
         - $ref: '#/components/parameters/DIBackend'
         - $ref: '#/components/parameters/EndDate'
@@ -805,9 +805,9 @@ paths:
         - heart-rate
       summary: Show heart-rate detail for one date (path variant without displayName)
       description: |
-        Identical payload to `daily`, reached on the wellness-service path that takes the date as a
-        query parameter and needs no displayName. Kept as a fallback and for use before the bootstrap
-        profile call has run.
+        Identical payload to `daily`, on the wellness-service path that takes the date as a query parameter.
+        It needs no displayName, so it is kept as a fallback and for use before the bootstrap profile
+        call has run.
       parameters:
         - $ref: '#/components/parameters/DIBackend'
         - $ref: '#/components/parameters/DateQuery'
@@ -878,9 +878,9 @@ paths:
         - wellness
       summary: Show logged hydration for one date, including goal and sweat-loss fields
       description: |
-        The superset form of the hydration payload: everything the shorter path returns plus the
-        activity sweat-loss and goal-adjustment fields. Prefer this variant unless the extra fields are
-        unwanted.
+        The hydration payload plus the activity sweat-loss and goal-adjustment fields.
+        It is a superset of everything the shorter path returns; prefer this variant unless the extra
+        fields are unwanted.
       parameters:
         - $ref: '#/components/parameters/DIBackend'
         - $ref: '#/components/parameters/DatePath'
@@ -1008,8 +1008,8 @@ paths:
         - activities
       summary: Show the summary for one activity
       description: |
-        Everything Garmin holds about a single activity at summary level: type, timing, distance,
-        elevation, aggregate heart rate and power. Take the id from the activity list.
+        Everything Garmin holds about one activity at summary level: type, timing, distance and elevation.
+        Aggregate heart rate and power come with it. Take the id from the activity list.
       parameters:
         - $ref: '#/components/parameters/DIBackend'
         - $ref: '#/components/parameters/ActivityId'
@@ -1066,9 +1066,9 @@ paths:
       x-class: point
 
       description: |
-        Seconds spent in each configured heart-rate zone during one activity, which is the raw material
-        for a training-polarisation ratio across a season. Combine with the zone settings to label the
-        zones.
+        Seconds spent in each configured heart-rate zone during one activity.
+        That is the raw material for a training-polarisation ratio across a season. Combine with the zone
+        settings to label the zones.
       x-pp-resource: activities
       x-pp-sync-walker:
         parent: activities

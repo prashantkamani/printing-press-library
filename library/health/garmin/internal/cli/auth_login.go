@@ -1,4 +1,4 @@
-// Copyright 2026 Aria Kamani and contributors. Licensed under Apache-2.0. See LICENSE.
+// Copyright 2026 Prashant Kamani and contributors. Licensed under Apache-2.0. See LICENSE.
 // Novel command: the Garmin loopback SSO sign-in. Implemented in place from
 // the printing-press novel-command scaffold; `generate --force` preserves an
 // implemented body. Shared auth machinery lives in garmin_auth.go.
