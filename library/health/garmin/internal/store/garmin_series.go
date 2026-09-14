@@ -9,8 +9,8 @@
 // archive is walked one window at a time. That walk needs two things the
 // generated store does not provide:
 //
-//  1. Per-series calendar state — how far forward the archive is complete,
-//     how far back it reaches, and where a backward walk stopped and why.
+//  1. Per-series calendar state — the filled range: the oldest day the
+//     series has been filled from and the newest day it is complete through.
 //     It lives in its own table rather than in the generated sync_state so a
 //     future press regeneration, or the generated `sync --full` cursor clear,
 //     cannot wipe an earliest_day that costs a multi-year re-walk to rebuild.
@@ -30,6 +30,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -44,25 +45,41 @@ type GarminSeriesState struct {
 	// LastCompleteDay is the newest day whose data is known complete. Today
 	// is never recorded here: the day is still accruing.
 	LastCompleteDay string
-	// EarliestDay is the oldest day the archive holds a row for.
+	// EarliestDay is the oldest day this series has been FILLED FROM: every
+	// day from here through LastCompleteDay has been requested. It is not a
+	// claim that a row exists for that day — a series is sparse by nature —
+	// only that the range was asked for and will not be asked for again.
 	EarliestDay string
-	// FrontierDay is the oldest day a backward walk has PROBED, including
-	// windows that came back empty. Resuming a backfill continues from the
-	// day before this one, so a run stopped mid-walk does not re-probe.
+	// FrontierDay is legacy state written by the retired backward walk. The
+	// column stays so an existing archive still loads; nothing reads it.
 	FrontierDay string
-	// StopReason records why the backward walk stopped: "empty_window_ceiling",
-	// "window_denied_stop", "floor", "never_returned_data", "interrupted",
-	// "feed_exhausted" (the activities feed), or "" when it has not run.
+	// StopReason records why the last run of this series stopped early:
+	// "all_windows_refused" (every window this run asked for came back
+	// HTTP 403), "interrupted", "feed_exhausted" (the activity feed reached
+	// its end), or "" for a run that finished normally. Rows written before
+	// walk version 2 may still carry the retired backward walk's reasons.
 	StopReason string
-	// EmptyWindows counts consecutive empty windows at the frontier. It is
-	// reset by any window that returns rows.
+	// EmptyWindows is legacy state written by the retired backward walk. The
+	// column stays so an existing archive still loads; nothing reads it.
 	EmptyWindows int
-	// TotalRows counts rows this series has ever stored. A series with zero
-	// is one whose instrument has never spoken, so its empty windows prove
-	// nothing about history.
+	// TotalRows is how many rows this series holds, recounted from the
+	// archive at the end of every series run rather than accumulated: the
+	// walk re-requests the feed's boundary day and a refresh window of days
+	// every run, so a running total would count the same row once per run.
 	TotalRows int
-	UpdatedAt time.Time
+	// WalkVersion is the walk that wrote this row. Rows below
+	// GarminWalkVersion were written by the retired backward walk, whose
+	// bookmark meant something different, and are read as unfilled.
+	WalkVersion int
+	UpdatedAt   time.Time
 }
+
+// GarminWalkVersion is the current walk's state version. A state row carrying
+// a lower number was written by the retired backward walk — whose
+// last_complete_day was the top of a range walked from the newest day down,
+// not the top of a contiguous filled range — so it cannot be resumed from and
+// is read as unfilled. Rows are rewritten at this version on the first save.
+const GarminWalkVersion = 2
 
 // KeyedRow is one row to store with an id the caller chose.
 type KeyedRow struct {
@@ -78,6 +95,7 @@ const garminSeriesStateDDL = `CREATE TABLE IF NOT EXISTS garmin_series_state (
 	stop_reason TEXT NOT NULL DEFAULT '',
 	empty_windows INTEGER NOT NULL DEFAULT 0,
 	total_rows INTEGER NOT NULL DEFAULT 0,
+	walk_version INTEGER NOT NULL DEFAULT 0,
 	updated_at DATETIME
 )`
 
@@ -89,7 +107,45 @@ func (s *Store) EnsureGarminSeriesState() error {
 	if _, err := s.db.Exec(garminSeriesStateDDL); err != nil {
 		return fmt.Errorf("creating garmin_series_state: %w", err)
 	}
+	// walk_version was added after the first archives were written, so the
+	// table may already exist without it. ALTER TABLE ADD COLUMN is the only
+	// migration needed — the default 0 is exactly "written by a walk older
+	// than GarminWalkVersion", which is what an existing row is.
+	has, err := s.garminSeriesStateHasColumn("walk_version")
+	if err != nil {
+		return err
+	}
+	if !has {
+		if _, err := s.db.Exec(`ALTER TABLE garmin_series_state ADD COLUMN walk_version INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("adding garmin_series_state.walk_version: %w", err)
+		}
+	}
 	return nil
+}
+
+func (s *Store) garminSeriesStateHasColumn(name string) (bool, error) {
+	rows, err := s.db.Query(`PRAGMA table_info(garmin_series_state)`)
+	if err != nil {
+		return false, fmt.Errorf("reading garmin_series_state columns: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid        int
+			colName    string
+			colType    string
+			notNull    int
+			defaultVal sql.NullString
+			pk         int
+		)
+		if err := rows.Scan(&cid, &colName, &colType, &notNull, &defaultVal, &pk); err != nil {
+			return false, err
+		}
+		if colName == name {
+			return true, rows.Err()
+		}
+	}
+	return false, rows.Err()
 }
 
 // GetGarminSeriesState returns the bookmark for one series. A series that has
@@ -99,9 +155,9 @@ func (s *Store) GetGarminSeriesState(series string) (GarminSeriesState, error) {
 	st := GarminSeriesState{Series: series}
 	var updated sql.NullString
 	err := s.db.QueryRow(
-		`SELECT last_complete_day, earliest_day, frontier_day, stop_reason, empty_windows, total_rows, updated_at
+		`SELECT last_complete_day, earliest_day, frontier_day, stop_reason, empty_windows, total_rows, walk_version, updated_at
 		   FROM garmin_series_state WHERE series = ?`, series,
-	).Scan(&st.LastCompleteDay, &st.EarliestDay, &st.FrontierDay, &st.StopReason, &st.EmptyWindows, &st.TotalRows, &updated)
+	).Scan(&st.LastCompleteDay, &st.EarliestDay, &st.FrontierDay, &st.StopReason, &st.EmptyWindows, &st.TotalRows, &st.WalkVersion, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return st, nil
 	}
@@ -117,7 +173,9 @@ func (s *Store) GetGarminSeriesState(series string) (GarminSeriesState, error) {
 }
 
 // SaveGarminSeriesState writes one series' bookmark. UpdatedAt is stamped
-// here so every caller records the same clock.
+// here so every caller records the same clock, and so is WalkVersion: a row
+// this walk writes is by definition a row this walk can resume from, so the
+// version is not something a caller can forget to set.
 func (s *Store) SaveGarminSeriesState(st GarminSeriesState) error {
 	if st.Series == "" {
 		return errors.New("garmin series state requires a series name")
@@ -126,8 +184,8 @@ func (s *Store) SaveGarminSeriesState(st GarminSeriesState) error {
 	defer s.unlockAfterWrite()
 	_, err := s.db.Exec(
 		`INSERT INTO garmin_series_state
-		   (series, last_complete_day, earliest_day, frontier_day, stop_reason, empty_windows, total_rows, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		   (series, last_complete_day, earliest_day, frontier_day, stop_reason, empty_windows, total_rows, walk_version, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(series) DO UPDATE SET
 		   last_complete_day = excluded.last_complete_day,
 		   earliest_day      = excluded.earliest_day,
@@ -135,9 +193,10 @@ func (s *Store) SaveGarminSeriesState(st GarminSeriesState) error {
 		   stop_reason       = excluded.stop_reason,
 		   empty_windows     = excluded.empty_windows,
 		   total_rows        = excluded.total_rows,
+		   walk_version      = excluded.walk_version,
 		   updated_at        = excluded.updated_at`,
 		st.Series, st.LastCompleteDay, st.EarliestDay, st.FrontierDay, st.StopReason,
-		st.EmptyWindows, st.TotalRows, time.Now().UTC().Format(time.RFC3339),
+		st.EmptyWindows, st.TotalRows, GarminWalkVersion, time.Now().UTC().Format(time.RFC3339),
 	)
 	if err != nil {
 		return fmt.Errorf("saving garmin series state for %s: %w", st.Series, err)
@@ -149,7 +208,7 @@ func (s *Store) SaveGarminSeriesState(st GarminSeriesState) error {
 // first, for status reporting.
 func (s *Store) ListGarminSeriesState() ([]GarminSeriesState, error) {
 	rows, err := s.db.Query(
-		`SELECT series, last_complete_day, earliest_day, frontier_day, stop_reason, empty_windows, total_rows, updated_at
+		`SELECT series, last_complete_day, earliest_day, frontier_day, stop_reason, empty_windows, total_rows, walk_version, updated_at
 		   FROM garmin_series_state ORDER BY series`)
 	if err != nil {
 		return nil, err
@@ -160,7 +219,7 @@ func (s *Store) ListGarminSeriesState() ([]GarminSeriesState, error) {
 		var st GarminSeriesState
 		var updated sql.NullString
 		if err := rows.Scan(&st.Series, &st.LastCompleteDay, &st.EarliestDay, &st.FrontierDay,
-			&st.StopReason, &st.EmptyWindows, &st.TotalRows, &updated); err != nil {
+			&st.StopReason, &st.EmptyWindows, &st.TotalRows, &st.WalkVersion, &updated); err != nil {
 			return nil, err
 		}
 		if updated.Valid {
@@ -314,4 +373,81 @@ func (s *Store) ResourceIDsNewestFirst(resourceType string, limit int) ([]string
 		out = append(out, BareResourceID(id))
 	}
 	return out, rows.Err()
+}
+
+// DistinctResourceIDs returns every distinct bare id held by any of the named
+// resource types, sorted. The day-keyed series store one row per calendar day
+// under the day as its id, so this is how the walk reads "which days does the
+// archive already have a reading for" without loading a single payload.
+func (s *Store) DistinctResourceIDs(resourceTypes []string) ([]string, error) {
+	if len(resourceTypes) == 0 {
+		return nil, nil
+	}
+	placeholders := make([]string, 0, len(resourceTypes))
+	args := make([]any, 0, len(resourceTypes))
+	for _, t := range resourceTypes {
+		placeholders = append(placeholders, "?")
+		args = append(args, t)
+	}
+	// #nosec G202 -- the only interpolated text is a comma-joined run of
+	// literal "?" placeholders built above; every resource type is bound as
+	// an argument and none of them reaches the SQL text.
+	query := `SELECT DISTINCT id FROM resources WHERE resource_type IN (` +
+		strings.Join(placeholders, ",") + `) ORDER BY id`
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, BareResourceID(id))
+	}
+	return out, rows.Err()
+}
+
+// ResourceJSONFieldValues returns one top-level JSON field of every row of a
+// resource type. It exists so a caller can derive a calendar day from the same
+// payload field its extractor reads, rather than from a second field that
+// could drift away from it.
+func (s *Store) ResourceJSONFieldValues(resourceType, field string) ([]string, error) {
+	rows, err := s.db.Query(
+		`SELECT json_extract(data, '$.' || ?) FROM resources WHERE resource_type = ?`, field, resourceType)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var v sql.NullString
+		if err := rows.Scan(&v); err != nil {
+			return nil, err
+		}
+		if v.Valid && v.String != "" {
+			out = append(out, v.String)
+		}
+	}
+	return out, rows.Err()
+}
+
+// AverageResourceBytes returns the mean stored size of one resource type's
+// rows and how many rows that mean is over. A caller estimating what a fetch
+// will cost uses it to replace a hand-measured constant with this archive's
+// own numbers once there are enough rows for the mean to mean anything.
+func (s *Store) AverageResourceBytes(resourceType string) (avg int, rows int, err error) {
+	var avgNull sql.NullFloat64
+	err = s.db.QueryRow(
+		`SELECT COUNT(*), AVG(LENGTH(data)) FROM resources WHERE resource_type = ?`, resourceType,
+	).Scan(&rows, &avgNull)
+	if err != nil {
+		return 0, 0, err
+	}
+	if avgNull.Valid {
+		avg = int(avgNull.Float64)
+	}
+	return avg, rows, nil
 }

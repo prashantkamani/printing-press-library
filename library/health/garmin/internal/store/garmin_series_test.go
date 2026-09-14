@@ -231,3 +231,105 @@ func TestResourceIDsNewestFirst_RespectsTheLimit(t *testing.T) {
 		t.Fatalf("got %d ids under a limit of 2", len(capped))
 	}
 }
+
+// An archive written before walk_version existed must load, gain the column,
+// and report its existing rows at version 0 — the reading that stops the new
+// walk from resuming a bookmark the old walk meant differently.
+func TestEnsureGarminSeriesState_AddsWalkVersionToAnExistingTable(t *testing.T) {
+	db := newSeriesTestStore(t)
+	if _, err := db.db.Exec(`DROP TABLE garmin_series_state`); err != nil {
+		t.Fatalf("drop table: %v", err)
+	}
+	// The table exactly as the previous release created it.
+	if _, err := db.db.Exec(`CREATE TABLE garmin_series_state (
+		series TEXT PRIMARY KEY,
+		last_complete_day TEXT NOT NULL DEFAULT '',
+		earliest_day TEXT NOT NULL DEFAULT '',
+		frontier_day TEXT NOT NULL DEFAULT '',
+		stop_reason TEXT NOT NULL DEFAULT '',
+		empty_windows INTEGER NOT NULL DEFAULT 0,
+		total_rows INTEGER NOT NULL DEFAULT 0,
+		updated_at DATETIME
+	)`); err != nil {
+		t.Fatalf("create legacy table: %v", err)
+	}
+	if _, err := db.db.Exec(`INSERT INTO garmin_series_state
+		(series, last_complete_day, earliest_day, frontier_day, stop_reason, empty_windows, total_rows, updated_at)
+		VALUES ('steps', '2026-09-12', '2025-05-25', '2024-04-29', 'empty_window_ceiling', 13, 76, NULL)`); err != nil {
+		t.Fatalf("insert legacy row: %v", err)
+	}
+
+	if err := db.EnsureGarminSeriesState(); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	// Idempotent: a second call must not try to add the column again.
+	if err := db.EnsureGarminSeriesState(); err != nil {
+		t.Fatalf("second migrate: %v", err)
+	}
+
+	st, err := db.GetGarminSeriesState("steps")
+	if err != nil {
+		t.Fatalf("load migrated row: %v", err)
+	}
+	if st.WalkVersion != 0 {
+		t.Fatalf("walk_version = %d, want 0: the row predates this walk", st.WalkVersion)
+	}
+	if st.LastCompleteDay != "2026-09-12" || st.TotalRows != 76 {
+		t.Fatalf("the migration lost data: %+v", st)
+	}
+
+	// The first save under this walk stamps the current version, whatever
+	// the caller passed.
+	st.WalkVersion = 0
+	if err := db.SaveGarminSeriesState(st); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	reloaded, err := db.GetGarminSeriesState("steps")
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded.WalkVersion != GarminWalkVersion {
+		t.Fatalf("walk_version after a save = %d, want %d", reloaded.WalkVersion, GarminWalkVersion)
+	}
+}
+
+// The signal-day query is what keeps a per-day fill affordable, so it must see
+// every cheap series' days and no others.
+func TestDistinctResourceIDsAndFieldValues(t *testing.T) {
+	db := newSeriesTestStore(t)
+	if err := db.Upsert("steps", "2026-09-01", json.RawMessage(`{"calendarDate":"2026-09-01"}`)); err != nil {
+		t.Fatalf("seed steps: %v", err)
+	}
+	if err := db.Upsert("sleep_score", "2026-09-02", json.RawMessage(`{"calendarDate":"2026-09-02"}`)); err != nil {
+		t.Fatalf("seed sleep_score: %v", err)
+	}
+	if err := db.Upsert("intensity_minutes", "2007-01-01", json.RawMessage(`{"calendarDate":"2007-01-01"}`)); err != nil {
+		t.Fatalf("seed intensity_minutes: %v", err)
+	}
+	ids, err := db.DistinctResourceIDs([]string{"steps", "sleep_score"})
+	if err != nil {
+		t.Fatalf("DistinctResourceIDs: %v", err)
+	}
+	if len(ids) != 2 || ids[0] != "2026-09-01" || ids[1] != "2026-09-02" {
+		t.Fatalf("ids = %v, want the two day-keyed rows in order", ids)
+	}
+
+	if err := db.Upsert("activities", "77", json.RawMessage(`{"activityId":77,"startTimeLocal":"2026-09-03 07:00:00"}`)); err != nil {
+		t.Fatalf("seed activity: %v", err)
+	}
+	starts, err := db.ResourceJSONFieldValues("activities", "startTimeLocal")
+	if err != nil {
+		t.Fatalf("ResourceJSONFieldValues: %v", err)
+	}
+	if len(starts) != 1 || starts[0] != "2026-09-03 07:00:00" {
+		t.Fatalf("startTimeLocal values = %v", starts)
+	}
+
+	avg, rows, err := db.AverageResourceBytes("steps")
+	if err != nil {
+		t.Fatalf("AverageResourceBytes: %v", err)
+	}
+	if rows != 1 || avg < 10 {
+		t.Fatalf("average = %d bytes over %d rows", avg, rows)
+	}
+}

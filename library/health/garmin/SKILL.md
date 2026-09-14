@@ -37,7 +37,7 @@ go install github.com/mvanhorn/printing-press-library/library/health/garmin/cmd/
 
 If `--version` reports "command not found" after install, the runtime cannot see the binary directory on `$PATH`. Do not proceed with skill commands until verification succeeds.
 
-Garmin Connect caps every daily-stats request at 28 days and offers no personal API token, which is why the ecosystem is a handful of Python libraries rather than a tool you can call. This CLI signs in through your own browser, keeps each account's tokens in its own home, walks the whole history into SQLite, and answers sleep, training, heart-rate and activity questions from the archive with JSON on stdout.
+Garmin Connect caps every daily-stats request at 28 days and offers no personal API token, which is why the ecosystem is a handful of Python libraries rather than a tool you can call. This CLI signs in through your own browser, keeps each account's tokens in its own home, fills the whole history into SQLite oldest day first — interrupt it and the next run continues where it stopped — and answers sleep, training, heart-rate and activity questions from the archive with JSON on stdout.
 
 ## When to Use This CLI
 
@@ -65,24 +65,32 @@ These capabilities aren't available in any other tool for this API.
   ```
 
 ### Local state that compounds
-- **`history`** — Walks the date-ranged daily-stats series backwards into a local SQLite archive and resumes where it stopped — 28-day windows where Garmin caps a request at 28 days, 364-day windows where it does not, and one request per day for the per-day series.
+- **`history`** — Fills a local SQLite archive from the oldest day forward, one bookmark per series, so an interrupted run continues where it stopped — 28-day windows where Garmin caps a request at 28 days, 364-day windows where it does not, and one request per day for the per-day series, asked only for days something was recorded.
 
   _Run this before any trend question; every analytics command reads the archive, not the API._
 
   ```bash
-  garmin-pp-cli history --backfill
+  garmin-pp-cli history --since all --dry-run
   ```
 
 ## Command Reference
 
-The novel `history` verb walks the date-ranged daily-stats series backwards into the local archive
-and resumes where it stopped — 28-day windows where Garmin caps a request at 28 days (sleep stats,
-sleep score, steps), 364-day windows where it does not (resting HR, VO2 max, intensity minutes), and
-one request per day for the per-day series (daily summary, sleep detail, daily HR, training
-readiness), bounded by `--days`. It also pages the activity feed and fans out over it for the
-per-activity fetches (detail, splits, HR zones), and keeps the account's heart-rate-zone
-configuration. `history` is the only command that fills the archive; the generated `sync` verb is
-superseded and prints a pointer to `history`.
+The novel `history` verb fills the local archive from the oldest day forward and keeps one bookmark
+per series, so an interrupted run continues where it stopped — 28-day windows where Garmin caps a
+request at 28 days (sleep stats, sleep score, steps), 364-day windows where it does not (resting HR,
+VO2 max, intensity minutes), and one request per day for the per-day series (daily summary, sleep
+detail, daily HR, training readiness), asked only for the days a cheaper series already shows a
+reading for. It also pages the activity feed and fans out over it for the per-activity fetches
+(detail, splits, HR zones), and keeps the account's heart-rate-zone configuration.
+
+How far back to go is the only choice it offers: `--since all` for everything the account holds,
+`--since YYYY-MM-DD` to start there, and neither to keep the depth the archive already has and catch
+up to today. A later, deeper `--since` extends the archive downward without re-fetching the range
+already filled. Before the per-activity and per-day fetches — the expensive half of a run — it
+prints what they will cost in requests, time and disk; `--dry-run` prints the same thing without
+fetching anything, and `--status` reports what each series already holds and still owes. `history`
+is the only command that fills the archive; the generated `sync` verb is superseded and prints a
+pointer to `history`.
 
 **account** — Bootstrap and identity: social profile, unit settings, and the account email a login is checked against.
 
@@ -147,6 +155,14 @@ garmin-pp-cli which "<capability in your own words>"
 `which` resolves a natural-language capability query to the best matching command from this CLI's curated feature index. Exit code `0` means at least one match; exit code `2` means no confident match — fall back to `--help` or use a narrower query. `--json` (and other machine formats) keep that exit-2 contract and write `{"matches":[]}` on stdout so agents can inspect the envelope without treating a miss as success.
 
 ## Recipes
+
+### First fill, and what to do if it stops
+
+```bash
+garmin-pp-cli history --since all
+```
+
+Fills every series from the oldest day it can reach. Before the expensive per-activity and per-day fetches it prints what they will cost in requests, time and disk — `--dry-run` prints the same thing without fetching anything. Interrupting is safe: run it again and it continues where it stopped. For a shallower fill, `--since 2026-01-01` starts there instead, and a later deeper `--since` extends the archive downward without re-fetching what is already stored.
 
 ### Four weeks of sleep score in one call
 

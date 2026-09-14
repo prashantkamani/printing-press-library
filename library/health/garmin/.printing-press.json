@@ -50,9 +50,9 @@
       "description": "Signs in through Garmin's own page in your browser, catches the redirect on a loopback port, and refuses to store a token whose account email does not match the one you named."
     },
     {
-      "name": "Windowed backfill of the 28-day-capped series",
+      "name": "Oldest-first archive fill of the 28-day-capped series",
       "command": "history",
-      "description": "Walks the date-ranged daily-stats series backwards into a local SQLite archive and resumes where it stopped — 28-day windows where Garmin caps a request at 28 days, 364-day windows where it does not, and one request per day for the per-day series."
+      "description": "Fills a local SQLite archive from the oldest day forward, one bookmark per series, so an interrupted run continues where it stopped — 28-day windows where Garmin caps a request at 28 days, 364-day windows where it does not, and one request per day for the per-day series, asked only for days something was recorded."
     }
   ]
 }

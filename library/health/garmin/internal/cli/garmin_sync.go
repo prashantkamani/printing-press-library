@@ -5,6 +5,10 @@
 //
 // `garmin-pp-cli history` — the windowed archive walk.
 //
+// Depth has one control, `--since` (N131 decision D12): `all`, or a date.
+// Every series walks oldest to newest and keeps one bookmark, so an
+// interrupted run resumes at the day after it (D15).
+//
 // Why this exists rather than the generated `sync`: Garmin has no "give me
 // everything since X" list endpoint. Its daily statistics come from range
 // endpoints whose path IS the date range, capped at 28 days per request
@@ -56,7 +60,9 @@ const (
 	// windowDays calendar days.
 	seriesWindowed garminSeriesKind = iota
 	// seriesPerDay answers for exactly one date, so depth costs one request
-	// per day and is bounded by --days rather than by the empty-window walk.
+	// per day. These series are walked over signal days only — the days a
+	// cheaper series already shows a reading for — rather than over the
+	// calendar.
 	seriesPerDay
 	// seriesOffsetPaged is the activity feed: offset paging, no date range.
 	seriesOffsetPaged
@@ -93,10 +99,10 @@ type garminSeries struct {
 	// display name, which the walk resolves once per run.
 	needsDisplayName bool
 
-	// floor is the oldest day worth asking for. Garmin Connect predates
-	// every consumer account in service, so this is a sanity stop, not a
-	// data claim: a backward walk that somehow never sees an empty window
-	// still terminates.
+	// floor is the oldest day this series will ever be asked for. Garmin
+	// Connect predates every consumer account in service, so it is where a
+	// full fill starts: no discovery call, and no assumption about when the
+	// account holder first wore something.
 	floor civilDay
 
 	// windowReq builds the request for a date range (seriesWindowed).
@@ -602,6 +608,12 @@ func extractMaxMetrics(raw json.RawMessage, _ civilDay) ([]garminRow, error) {
 type garminEmitter struct {
 	w       io.Writer
 	machine bool
+	// noteW carries the lines that are neither an event nor an error: the
+	// cost estimate and the one-off notices. In human mode they go to
+	// stderr so the run's own output stays pipeable; in machine mode the
+	// estimate becomes an event and the notices are dropped, because a
+	// machine reader has the same facts in the event stream.
+	noteW io.Writer
 }
 
 func (e *garminEmitter) raw(line string) {
@@ -637,15 +649,51 @@ func (e *garminEmitter) start(series string) {
 	e.human("  %s ...", series)
 }
 
-func (e *garminEmitter) progress(series string, fetched int, window string) {
+// progress reports one unit of work — a window, a day, a page — and the
+// bookmark as it now stands. The bookmark is the interesting half: it is where
+// a killed run will resume, so printing it is what makes "interrupting is
+// safe" something the caller can see rather than something the docs claim.
+func (e *garminEmitter) progress(series string, fetched int, window, bookmark string) {
 	if e == nil {
 		return
 	}
 	if e.machine {
 		e.raw(`{"event":"sync_progress","resource":` + jsonString(series) +
-			`,"fetched":` + strconv.Itoa(fetched) + `,"window":` + jsonString(window) + `}`)
+			`,"fetched":` + strconv.Itoa(fetched) + `,"window":` + jsonString(window) +
+			`,"bookmark":` + jsonString(bookmark) + `}`)
 		return
 	}
+	if bookmark == "" {
+		e.human("    %s %s: %d rows", series, window, fetched)
+		return
+	}
+	e.human("    %s %s: %d rows (complete through %s)", series, window, fetched, bookmark)
+}
+
+// note is a human-mode line that is not an event: it goes to noteW, so it
+// never lands in the middle of piped output, and it is silent in machine mode.
+func (e *garminEmitter) note(message string) {
+	if e == nil || e.machine || e.noteW == nil {
+		return
+	}
+	_, _ = fmt.Fprintln(e.noteW, message)
+}
+
+// estimate reports what the expensive half of the run will cost, before it
+// starts. sync_estimate is the one event name here that the generated sync
+// vocabulary does not have: there is no generated event for "this is what the
+// next few thousand requests will cost you", and inventing a field on
+// sync_progress would have made a cost projection look like work done.
+func (e *garminEmitter) estimate(est garminWorkEstimate) {
+	if e == nil {
+		return
+	}
+	if e.machine {
+		e.raw(fmt.Sprintf(`{"event":"sync_estimate","since":%s,"requests":%d,"minutes":%.1f,"megabytes":%.1f}`,
+			jsonString(est.Since), est.Requests, est.Minutes, est.Megabytes))
+		return
+	}
+	e.note(est.line())
 }
 
 func (e *garminEmitter) warn(series, reason, message string) {
@@ -708,19 +756,22 @@ var errGarminRateLimited = errors.New("garmin rate-limited the request; the walk
 // reported once and acted on immediately rather than restated per call.
 var errGarminWallOfFailures = errors.New("every recent request failed; the walk stopped rather than continuing to ask")
 
-// errGarminWindowDenied marks a window the backward walk was refused.
+// errGarminWindowDenied marks a window Garmin refused as pre-history.
 //
 // Garmin answers HTTP 403 to a date range that reaches past the start of the
 // account's own history — the same status it gives a credential that has gone
-// stale, with nothing in the response to tell the two apart. Where the walk is
-// does tell them apart. In the forward leg every window lies inside the
-// account's lifetime, so a 403 there is a fault and counts toward the wall. In
-// the backward leg it is the account's history start speaking, so it ends that
-// series' walk the way an empty window does and never counts toward the wall.
+// stale, with nothing in the response to tell the two apart. Two facts about
+// the walk tell them apart, and both must hold before a 403 is read as the
+// account's history start rather than as a fault: the series has not stored a
+// row yet (so the window is below everything this account has ever shown us),
+// and this run has already had one request answered with HTTP 200 (so the
+// credential demonstrably works). Otherwise the refusal counts toward the
+// consecutive-failure wall and the series ends with its bookmark unmoved, to
+// be retried on the next run.
 //
-// Live on 2026-09-12: `history --backfill` exited 5 because the first backward
-// window of intensity_minutes answered 403 and ten refusals in a row across
-// the ranged series read as a dead credential, so the run stopped before
+// Live on 2026-09-12: the old backward walk exited 5 because the first window
+// of intensity_minutes answered 403 and ten refusals in a row across the
+// ranged series read as a dead credential, so the run stopped before
 // activities and every per-day series was attempted.
 var errGarminWindowDenied = errors.New("garmin refused this window")
 
@@ -754,7 +805,7 @@ func isWalkAborted(err error) bool {
 }
 
 // garminPacer spaces requests. The default 300 ms is the interval a live
-// 94-window backfill walked at without a single 429 (N131 §9.2).
+// 94-window live fill walked at without a single 429 (N131 §9.2).
 type garminPacer struct {
 	delay time.Duration
 	sleep func(time.Duration)
@@ -785,20 +836,58 @@ func (p *garminPacer) wait() {
 // The walk
 // ---------------------------------------------------------------------------
 
+// garminDepthMode is which of --since's three states a run is in. They are
+// three, not two, because "the caller said nothing" and "the caller said all"
+// mean different things on a series that is already filled: a plain `history`
+// keeps the depth the archive already has, while an explicit --since all asks
+// for everything (D15).
+type garminDepthMode int
+
+const (
+	// depthStored is --since absent: keep whatever depth each series
+	// already has, and fill forward from its bookmark.
+	depthStored garminDepthMode = iota
+	// depthAll is --since all: fill from each series' own floor.
+	depthAll
+	// depthFrom is --since YYYY-MM-DD: fill from that day, or from the
+	// series' floor if that is later.
+	depthFrom
+)
+
+// garminDepth is the parsed --since value.
+type garminDepth struct {
+	mode garminDepthMode
+	day  civilDay
+}
+
+func (d garminDepth) String() string {
+	switch d.mode {
+	case depthAll:
+		return "all"
+	case depthFrom:
+		return d.day.String()
+	}
+	return ""
+}
+
+// garminRefreshDays is how many of the newest complete signal days a per-day
+// series re-requests on every run. A day can be fetched before the watch that
+// recorded it has finished syncing — the owner's bike computer uploads when he
+// gets home — so the newest days are asked for again rather than frozen at
+// whatever was there when they first came into range.
+const garminRefreshDays = 7
+
 type garminWalkOptions struct {
-	series             []string
-	days               int
-	backfill           bool
-	emptyWindowCeiling int
-	delay              time.Duration
-	maxPages           int
-	maxDependents      int
-	activityPageSize   int
+	series           []string
+	depth            garminDepth
+	delay            time.Duration
+	maxPages         int
+	maxDependents    int
+	activityPageSize int
 	// maxConsecutiveFailures ends the run when this many calls fail in a
 	// row. Zero means the default.
 	maxConsecutiveFailures int
 	strict                 bool
-	dryRun                 bool
 	now                    func() time.Time
 	loc                    *time.Location
 	sleep                  func(time.Duration)
@@ -818,6 +907,7 @@ type garminWalker struct {
 	db          *store.Store
 	emit        *garminEmitter
 	opts        garminWalkOptions
+	planner     *garminPlanner
 	pacer       *garminPacer
 	displayName string
 	nameLoaded  bool
@@ -825,6 +915,14 @@ type garminWalker struct {
 	// consecutiveFailures counts failed calls since the last success,
 	// across every series in the run.
 	consecutiveFailures int
+	// sawHTTP200 records that Garmin has answered at least one request in
+	// this run. It is the half of the pre-history test that speaks for the
+	// credential: until it is true, a 403 is as likely to be a dead token as
+	// a date before the account existed.
+	sawHTTP200 bool
+	// noticedShallowSince keeps the "--since is above what the archive
+	// already holds" line to one per run rather than one per series.
+	noticedShallowSince bool
 }
 
 // get is the single choke point for every API call: it paces, counts, and
@@ -833,10 +931,11 @@ func (w *garminWalker) get(ctx context.Context, path string, params map[string]s
 	return w.getClassified(ctx, path, params, false)
 }
 
-// getHistoryEdge is get for the backward leg of a windowed walk, the one place
-// a refused window is data rather than a fault. See errGarminWindowDenied.
-func (w *garminWalker) getHistoryEdge(ctx context.Context, path string, params map[string]string) (json.RawMessage, error) {
-	return w.getClassified(ctx, path, params, true)
+// getHistoryEdge is get for a window that may lie before the account existed,
+// the one place a refused window is data rather than a fault. The caller
+// decides that per request; see errGarminWindowDenied for the two conditions.
+func (w *garminWalker) getHistoryEdge(ctx context.Context, path string, params map[string]string, atEdge bool) (json.RawMessage, error) {
+	return w.getClassified(ctx, path, params, atEdge)
 }
 
 func (w *garminWalker) getClassified(ctx context.Context, path string, params map[string]string, atHistoryEdge bool) (json.RawMessage, error) {
@@ -852,8 +951,8 @@ func (w *garminWalker) getClassified(ctx context.Context, path string, params ma
 			// Neither counted nor cleared. Not counted, because a refusal
 			// past the history start is not a failing client; not cleared,
 			// because it is not a working one either, so a credential that
-			// has genuinely died still hits the wall on the next request it
-			// makes rather than walking every series to its ceiling first.
+			// dies mid-run still hits the wall on the next request it makes
+			// rather than walking every remaining window first.
 			return nil, fmt.Errorf("%w: %v", errGarminWindowDenied, err)
 		}
 		w.consecutiveFailures++
@@ -867,6 +966,7 @@ func (w *garminWalker) getClassified(ctx context.Context, path string, params ma
 		return nil, err
 	}
 	w.consecutiveFailures = 0
+	w.sawHTTP200 = true
 	return data, err
 }
 
@@ -913,6 +1013,12 @@ func (w *garminWalker) storeRows(series garminSeries, rows []garminRow) (int, er
 // windowed series too. The authoritative bookmark stays in
 // garmin_series_state; this is a projection, and a failure to write it is a
 // warning rather than a lost window.
+//
+// The projection is written once, when a series finishes. A run killed
+// mid-series therefore leaves doctor's sync_state behind the real bookmark
+// until the next run completes that series — garmin_series_state is
+// checkpointed after every window and is the one to read, which is what
+// `history --status` does.
 func (w *garminWalker) mirrorSyncState(series string, st store.GarminSeriesState) {
 	if err := w.db.SaveSyncState(series, st.LastCompleteDay, st.TotalRows); err != nil {
 		w.emit.warn(series, "sync_state_mirror_failed", "windowed state was saved but the generated sync_state row was not updated: "+err.Error())
@@ -927,8 +1033,104 @@ func dayRange(rows []garminRow) (oldest, newest civilDay) {
 	return oldest, newest
 }
 
-// walkWindowed runs one date-range series: forward to catch up, then, under
-// --backfill, backwards until the empty-window ceiling.
+// garminWindowStatus is what one window request produced.
+type garminWindowStatus int
+
+const (
+	// windowStored: HTTP 200, rows extracted and written (possibly none).
+	windowStored garminWindowStatus = iota
+	// windowDenied: HTTP 403 on a window that lies before this account's
+	// history, which the walk steps over. See errGarminWindowDenied.
+	windowDenied
+	// windowFailed: anything else. The bookmark stops moving.
+	windowFailed
+)
+
+// fetchWindow makes one windowed request and stores what it returned. A
+// non-nil error is fatal to the run — a rate limit, a wall of failures, or a
+// store that would not write; everything else is reported as a status.
+func (w *garminWalker) fetchWindow(ctx context.Context, s garminSeries, win dayWindow, displayName string, atEdge bool, out *garminSeriesOutcome) (garminWindowStatus, int, error) {
+	path, params := s.windowReq(win, displayName)
+	data, callErr := w.getHistoryEdge(ctx, path, params, atEdge)
+	if callErr != nil {
+		if isWalkAborted(callErr) {
+			return windowFailed, 0, callErr
+		}
+		if errors.Is(callErr, errGarminWindowDenied) {
+			return windowDenied, 0, nil
+		}
+		out.warned = true
+		w.emit.warn(s.name, "window_fetch_failed", "window "+win.String()+": "+callErr.Error())
+		return windowFailed, 0, nil
+	}
+	rows, exErr := s.extract(data, win.end)
+	if exErr != nil {
+		out.warned = true
+		w.emit.anomaly(s.name, "window_shape_unrecognized", 0, 0)
+		return windowFailed, 0, nil
+	}
+	stored, storeErr := w.storeRows(s, rows)
+	if storeErr != nil {
+		return windowFailed, 0, storeErr
+	}
+	out.stored += stored
+	return windowStored, stored, nil
+}
+
+// atHistoryEdge says whether a 403 on the next request would be Garmin
+// declining a date range from before this account existed rather than
+// declining this client. Both halves have to hold: the series has never stored
+// a row (so nothing proves the account reaches that far back), and Garmin has
+// already answered something in this run with a 200 (so the credential works).
+func (w *garminWalker) atHistoryEdge(rowsAtStart, storedThisRun int) bool {
+	return rowsAtStart == 0 && storedThisRun == 0 && w.sawHTTP200
+}
+
+// noticeShallowSince says once per run that --since asked for less depth than
+// the archive already has. It is a notice rather than a warning because
+// nothing is wrong: the deeper rows stay, and the run simply does not go back
+// down to fetch what it already holds.
+func (w *garminWalker) noticeShallowSince(st store.GarminSeriesState) {
+	if w.opts.depth.mode != depthFrom || w.noticedShallowSince {
+		return
+	}
+	earliest := mustDay(st.EarliestDay)
+	if earliest.isZero() || !earliest.before(w.opts.depth.day) {
+		return
+	}
+	w.noticedShallowSince = true
+	w.emit.note(fmt.Sprintf(
+		"The archive already reaches back to %s, deeper than --since %s; nothing below that date is fetched again and nothing already stored is dropped.",
+		earliest, w.opts.depth.day))
+}
+
+// finishSeries recounts the series' rows from the archive and saves the state.
+//
+// Recounted, not accumulated: this walk re-requests the feed's boundary day
+// and a refresh window of days on every run, and an interrupted extension leg
+// restarts from the floor, so a running total would count the same row once
+// per run — the mistake walkSingleDocument already documents for its own case.
+func (w *garminWalker) finishSeries(s garminSeries, st store.GarminSeriesState, out *garminSeriesOutcome) {
+	rows, err := w.db.CountResourceRows(s.resource)
+	if err == nil {
+		st.TotalRows = rows
+	}
+	if saveErr := w.db.SaveGarminSeriesState(st); saveErr != nil {
+		out.errored, out.err = true, saveErr
+		return
+	}
+	w.mirrorSyncState(s.name, st)
+}
+
+// walkWindowed runs one date-range series oldest day first.
+//
+// Two legs, one bookmark. The extension leg runs only when this run asks for a
+// floor below the range already filled: it walks from that floor up to the day
+// before the filled range and stamps the new floor only when it completes, so
+// an interrupted extension simply starts again from the floor next run rather
+// than leaving a gap nothing would ever return to. The forward leg then walks
+// from the day after the bookmark to today, checkpointing after every window,
+// which is what makes a killed run resume at bookmark + 1.
 func (w *garminWalker) walkWindowed(ctx context.Context, s garminSeries) garminSeriesOutcome {
 	out := garminSeriesOutcome{series: s.name}
 	st, err := w.db.GetGarminSeriesState(s.name)
@@ -936,6 +1138,7 @@ func (w *garminWalker) walkWindowed(ctx context.Context, s garminSeries) garminS
 		out.errored, out.err = true, err
 		return out
 	}
+	st = garminResumableState(st)
 
 	displayName := ""
 	if s.needsDisplayName {
@@ -945,235 +1148,145 @@ func (w *garminWalker) walkWindowed(ctx context.Context, s garminSeries) garminS
 			return out
 		}
 	}
+	rowsAtStart, err := w.db.CountResourceRows(s.resource)
+	if err != nil {
+		out.errored, out.err = true, err
+		return out
+	}
 
 	now := today(w.opts.now, w.opts.loc)
 	ceiling := completeDayCeiling(now)
+	filled := garminSeriesFilled(st)
+	floor := w.planner.windowedFloor(s, st)
+	w.noticeShallowSince(st)
 
-	// --- forward leg: from the day after the last complete day to today.
-	from := now.addDays(-(w.opts.days - 1))
-	if st.LastCompleteDay != "" {
-		if last, parseErr := parseCivilDay(st.LastCompleteDay); parseErr == nil {
-			from = last.addDays(1)
+	denied := 0
+	lastDenied := civilDay{}
+	okWindows := 0
+
+	// --- extension leg: only when this run reaches below the filled range.
+	if filled {
+		earliest := mustDay(st.EarliestDay)
+		if floor.before(earliest) {
+			broken := false
+			for _, win := range planForwardWindows(floor, earliest.addDays(-1), s.windowDays) {
+				status, stored, fatal := w.fetchWindow(ctx, s, win, displayName,
+					w.atHistoryEdge(rowsAtStart, out.stored), &out)
+				if fatal != nil {
+					out.errored, out.err = true, fatal
+					return out
+				}
+				switch status {
+				case windowDenied:
+					denied++
+					lastDenied = win.end
+				case windowFailed:
+					broken = true
+				case windowStored:
+					okWindows++
+					w.emit.progress(s.name, stored, win.String(), st.LastCompleteDay)
+				}
+				if broken {
+					break
+				}
+			}
+			// A leg whose every window Garmin refused proves nothing about
+			// the range it asked for, so the floor does not move over it:
+			// the same range is asked for again next run, which is what the
+			// all_windows_refused warning tells the caller happens.
+			if !broken && okWindows > 0 {
+				st.EarliestDay = minDay(earliest, floor).String()
+			}
+			if saveErr := w.db.SaveGarminSeriesState(st); saveErr != nil {
+				out.errored, out.err = true, saveErr
+				return out
+			}
 		}
+	}
+
+	// --- forward leg: from the day after the bookmark to today.
+	from := floor
+	if filled {
+		from = mustDay(st.LastCompleteDay).addDays(1)
 	}
 	if from.after(now) {
 		// Already complete through yesterday; still refresh today, whose
 		// row is partial by definition.
 		from = now
 	}
-
-	newestStored := civilDay{}
-	oldestStored := civilDay{}
-	if st.EarliestDay != "" {
-		if d, parseErr := parseCivilDay(st.EarliestDay); parseErr == nil {
-			oldestStored = d
-		}
-	}
-
-	// last_complete_day is a claim that EVERY day up to it is archived, so it
-	// may only advance across an unbroken run of successful windows. Once one
-	// window fails, later windows still fetch and store — their rows are real
-	// — but the bookmark stops moving, so the next run re-requests the gap
-	// instead of stepping over it forever.
 	forwardBroken := false
-
 	for _, win := range planForwardWindows(from, now, s.windowDays) {
-		path, params := s.windowReq(win, displayName)
-		data, callErr := w.get(ctx, path, params)
-		if callErr != nil {
-			if isWalkAborted(callErr) {
-				out.errored, out.err = true, callErr
-				return out
-			}
-			out.warned = true
-			forwardBroken = true
-			w.emit.warn(s.name, "window_fetch_failed", "window "+win.String()+": "+callErr.Error())
-			continue
-		}
-		rows, exErr := s.extract(data, win.end)
-		if exErr != nil {
-			out.warned = true
-			forwardBroken = true
-			w.emit.anomaly(s.name, "window_shape_unrecognized", 0, 0)
-			continue
-		}
-		stored, storeErr := w.storeRows(s, rows)
-		if storeErr != nil {
-			out.errored, out.err = true, storeErr
+		status, stored, fatal := w.fetchWindow(ctx, s, win, displayName,
+			w.atHistoryEdge(rowsAtStart, out.stored), &out)
+		if fatal != nil {
+			out.errored, out.err = true, fatal
 			return out
 		}
-		out.stored += stored
-		st.TotalRows += stored
-		o, n := dayRange(rows)
-		oldestStored = minDay(oldestStored, o)
-		newestStored = maxDay(newestStored, n)
-		w.emit.progress(s.name, stored, win.String())
-
-		// Checkpoint after every window, not at the end of the series: a
-		// run killed mid-walk must resume where it stopped.
+		switch status {
+		case windowDenied:
+			denied++
+			lastDenied = win.end
+			continue
+		case windowFailed:
+			// Later windows still fetch — their rows are real — but the
+			// bookmark stops here, so the next run re-requests the gap
+			// instead of stepping over it forever.
+			forwardBroken = true
+			continue
+		}
+		okWindows++
 		if !forwardBroken {
-			st.LastCompleteDay = minDay(maxDay(mustDay(st.LastCompleteDay), minDay(win.end, ceiling)), ceiling).String()
+			st.LastCompleteDay = maxDay(mustDay(st.LastCompleteDay), minDay(win.end, ceiling)).String()
+			// A floor above the newest complete day describes no range at
+			// all; stamping it would leave earliest_day after
+			// last_complete_day and pin the depth there.
+			if !from.after(ceiling) {
+				st.EarliestDay = minDay(mustDay(st.EarliestDay), from).String()
+			}
 		}
-		if oldestStored.isZero() {
-			st.EarliestDay = ""
-		} else {
-			st.EarliestDay = oldestStored.String()
-		}
+		w.emit.progress(s.name, stored, win.String(), st.LastCompleteDay)
 		if saveErr := w.db.SaveGarminSeriesState(st); saveErr != nil {
 			out.errored, out.err = true, saveErr
 			return out
 		}
 	}
 
-	// --- backward leg, only under --backfill.
-	if w.opts.backfill {
-		frontier := oldestStored
-		if st.FrontierDay != "" {
-			if d, parseErr := parseCivilDay(st.FrontierDay); parseErr == nil {
-				frontier = minDay(frontier, d)
-			}
-		}
-		if frontier.isZero() {
-			frontier = from
-		}
-		empty := st.EmptyWindows
-		if st.StopReason == "never_returned_data" && st.TotalRows > 0 {
-			// The forward leg has since found rows, so the run of empty
-			// windows that once read as "this account has no history"
-			// no longer proves anything. Start the count again.
-			empty = 0
-		}
-		everSaw := st.TotalRows > 0
-		// A walk that already reached its ceiling stays there. Raising
-		// --empty-window-ceiling resumes it deeper — from the same count,
-		// so the flag means "this many consecutive empty windows in total",
-		// not "this many more".
-		if st.StopReason != "" && empty >= w.opts.emptyWindowCeiling {
-			if st.StopReason == "never_returned_data" {
-				out.warned = true
-				w.emit.warn(s.name, "series_never_returned_data",
-					"this series has never stored a row and its backward walk already reached the empty-window ceiling; earliest_day stays unset because an empty window cannot distinguish an account with no data from a request this tool got wrong")
-			}
-			w.mirrorSyncState(s.name, st)
-			return out
-		}
-		// lastGoodWindow is the oldest window this run actually fetched, which
-		// is what a refusal below it makes a claim about.
-		lastGoodWindow := ""
-		// denied counts refusals so a walk that ends at the floor or the
-		// ceiling still says how many windows were refused rather than
-		// reporting them as ordinary empty ones.
-		denied := 0
-		stop := ""
-		for {
-			win, ok := planBackwardWindow(frontier, s.floor, s.windowDays)
-			if !ok {
-				stop = "floor"
-				break
-			}
-			path, params := s.windowReq(win, displayName)
-			data, callErr := w.getHistoryEdge(ctx, path, params)
-			if callErr != nil {
-				if isWalkAborted(callErr) {
-					out.errored, out.err = true, callErr
-					return out
-				}
-				if errors.Is(callErr, errGarminWindowDenied) {
-					// A refused window is an empty window: it counts toward
-					// the ceiling and moves the frontier, so a re-run does
-					// not re-probe it, and the walk ends at the ceiling
-					// rather than at the wall.
-					empty++
-					denied++
-					frontier = win.start
-					st.FrontierDay = frontier.String()
-					st.EmptyWindows = empty
-					if saveErr := w.db.SaveGarminSeriesState(st); saveErr != nil {
-						out.errored, out.err = true, saveErr
-						return out
-					}
-					if empty >= w.opts.emptyWindowCeiling {
-						stop = "window_denied_stop"
-						break
-					}
-					continue
-				}
-				out.warned = true
-				w.emit.warn(s.name, "window_fetch_failed", "window "+win.String()+": "+callErr.Error())
-				stop = "interrupted"
-				break
-			}
-			lastGoodWindow = win.String()
-			rows, exErr := s.extract(data, win.end)
-			if exErr != nil {
-				out.warned = true
-				w.emit.anomaly(s.name, "window_shape_unrecognized", 0, 0)
-				stop = "interrupted"
-				break
-			}
-			stored, storeErr := w.storeRows(s, rows)
-			if storeErr != nil {
-				out.errored, out.err = true, storeErr
-				return out
-			}
-			out.stored += stored
-			st.TotalRows += stored
-			w.emit.progress(s.name, stored, win.String())
-
-			if len(rows) == 0 {
-				empty++
-			} else {
-				empty = 0
-				everSaw = true
-				o, _ := dayRange(rows)
-				oldestStored = minDay(oldestStored, o)
-			}
-			frontier = win.start
-			st.FrontierDay = frontier.String()
-			st.EmptyWindows = empty
-			if !oldestStored.isZero() {
-				st.EarliestDay = oldestStored.String()
-			}
-			if saveErr := w.db.SaveGarminSeriesState(st); saveErr != nil {
-				out.errored, out.err = true, saveErr
-				return out
-			}
-			if empty >= w.opts.emptyWindowCeiling {
-				stop = "empty_window_ceiling"
-				break
-			}
-		}
-		// A series that has never returned a single row proves nothing by
-		// returning empty windows: the same silence covers "no wearable on
-		// this account" and "this request shape is wrong". Say so, and do
-		// not let the ceiling stand as a history claim.
-		if !everSaw {
-			stop = "never_returned_data"
-			st.EarliestDay = ""
-			out.warned = true
-			w.emit.warn(s.name, "series_never_returned_data",
-				"every window came back empty and this series has never stored a row; earliest_day was left unset because an empty window cannot distinguish an account with no data from a request this tool got wrong")
-		}
-		if denied > 0 {
-			out.warned = true
-			msg := fmt.Sprintf("Garmin refused %d window(s) before this point (HTTP 403); those ranges reach past the account's history start and will not be re-requested.", denied)
-			if stop == "window_denied_stop" {
-				msg = fmt.Sprintf("Garmin refused %d window(s) before this point (HTTP 403); the walk stopped at the account's history start.", denied)
-			}
-			if lastGoodWindow != "" {
-				msg += " The earliest window it did fetch was " + lastGoodWindow + "."
-			}
-			w.emit.warn(s.name, "window_denied_stop", msg)
-		}
-		st.StopReason = stop
-		if saveErr := w.db.SaveGarminSeriesState(st); saveErr != nil {
-			out.errored, out.err = true, saveErr
-			return out
-		}
+	switch {
+	case denied > 0 && okWindows == 0:
+		// A dead or blocked token refuses everything, and so does a date
+		// range before the account existed. A series that got nothing but
+		// refusals has not proven which, so it is not marked complete.
+		st.StopReason = "all_windows_refused"
+		out.warned = true
+		w.emit.warn(s.name, "all_windows_refused", fmt.Sprintf(
+			"Garmin refused all %d window(s) this run asked for (HTTP 403), the most recent ending %s; nothing was marked complete, so the same range is asked for again next run.",
+			denied, lastDenied))
+	case forwardBroken:
+		st.StopReason = "interrupted"
+	default:
+		st.StopReason = ""
+	}
+	if denied > 0 && okWindows > 0 {
+		out.warned = true
+		w.emit.warn(s.name, "window_denied", fmt.Sprintf(
+			"Garmin refused %d window(s) (HTTP 403), the most recent ending %s; those ranges reach past this account's history start and were treated as empty.",
+			denied, lastDenied))
 	}
 
-	w.mirrorSyncState(s.name, st)
+	w.finishSeries(s, st, &out)
 	return out
+}
+
+// garminResumableState drops the filled range a retired backward walk wrote.
+// That walk's earliest_day meant "the oldest day a row exists for", not "the
+// oldest day this walk requested", so carrying it into a walk_version-2 row
+// would certify coverage nothing has proven. The stored rows stay; only the
+// claim about them goes.
+func garminResumableState(st store.GarminSeriesState) store.GarminSeriesState {
+	if st.WalkVersion < store.GarminWalkVersion {
+		st.EarliestDay, st.LastCompleteDay, st.StopReason = "", "", ""
+	}
+	return st
 }
 
 // mustDay parses a stored day string, returning the zero day for "" or junk.
@@ -1190,16 +1303,20 @@ func mustDay(s string) civilDay {
 	return d
 }
 
-// walkPerDay runs one per-date series over the last --days days.
+// walkPerDay runs one per-date series over signal days, oldest first.
 //
-// These series are deliberately NOT backfilled to the empty-window ceiling.
-// One request buys one day, and the payloads are large: a single night of
-// sleep_detail measured 95 KB on a live account, and a full daily_hr day
-// 11 KB. Walking a six-year account (the live account's steps reach
-// 2020-07-06, 2 251 days) would cost 2 251 requests per series — about eleven
-// minutes each at the 300 ms pacing — and roughly 215 MB of sleep detail
-// alone. So depth here is an explicit --days choice a caller makes with that
-// cost in view, and --backfill says so rather than silently doing it.
+// One request buys one day here, and the payloads are large — a single night
+// of sleep_detail measured 88 KB on the reference archive — so the walk asks
+// only for days something was actually recorded: a day with a row in one of
+// the cheap series, or a day an activity started on (garminSignalResources).
+// On the reference accounts that is every calendar day for a daily wearer and
+// about 134 days out of 1 908 for an occasional cyclist, which is the whole
+// difference between a fill that is worth running and one that is not.
+//
+// A day that was requested and came back empty sits inside the filled range
+// and is never requested again; the newest garminRefreshDays signal days are
+// the exception, re-requested every run because a day can be fetched before
+// the device that recorded it has finished uploading.
 func (w *garminWalker) walkPerDay(ctx context.Context, s garminSeries) garminSeriesOutcome {
 	out := garminSeriesOutcome{series: s.name}
 	st, err := w.db.GetGarminSeriesState(s.name)
@@ -1207,30 +1324,30 @@ func (w *garminWalker) walkPerDay(ctx context.Context, s garminSeries) garminSer
 		out.errored, out.err = true, err
 		return out
 	}
+	st = garminResumableState(st)
+	work, err := w.planner.perDayWork(s, st)
+	if err != nil {
+		out.errored, out.err = true, err
+		return out
+	}
+	w.noticeShallowSince(st)
+
 	displayName := ""
-	if s.needsDisplayName {
+	if s.needsDisplayName && len(work.days) > 0 {
 		displayName, err = w.resolveDisplayName(ctx)
 		if err != nil {
 			out.errored, out.err = true, err
 			return out
 		}
 	}
-	if w.opts.backfill {
-		out.warned = true
-		w.emit.warn(s.name, "per_day_series_bounded_by_days",
-			fmt.Sprintf("this series answers one calendar day per request, so --backfill does not walk it to the empty-window ceiling; it covered the last %d days. Raise --days to go deeper, knowing each extra day is one more request.", w.opts.days))
-	}
 
-	now := today(w.opts.now, w.opts.loc)
-	ceiling := completeDayCeiling(now)
-	from := now.addDays(-(w.opts.days - 1))
-	if !s.floor.isZero() && from.before(s.floor) {
-		from = s.floor
-	}
+	ceiling := completeDayCeiling(today(w.opts.now, w.opts.loc))
+	filled := garminSeriesFilled(st)
+	earliest := mustDay(st.EarliestDay)
+	extBroken, forwardBroken := false, false
 
-	newest := civilDay{}
-	oldest := mustDay(st.EarliestDay)
-	for _, day := range enumerateDaysNewestFirst(from, now) {
+	for _, day := range work.days {
+		extension := filled && day.before(earliest)
 		path, params := s.dayReq(day, displayName)
 		data, callErr := w.get(ctx, path, params)
 		if callErr != nil {
@@ -1240,12 +1357,22 @@ func (w *garminWalker) walkPerDay(ctx context.Context, s garminSeries) garminSer
 			}
 			out.warned = true
 			w.emit.warn(s.name, "day_fetch_failed", day.String()+": "+callErr.Error())
+			if extension {
+				extBroken = true
+			} else {
+				forwardBroken = true
+			}
 			continue
 		}
 		rows, exErr := s.extract(data, day)
 		if exErr != nil {
 			out.warned = true
 			w.emit.anomaly(s.name, "day_shape_unrecognized", 0, 0)
+			if extension {
+				extBroken = true
+			} else {
+				forwardBroken = true
+			}
 			continue
 		}
 		stored, storeErr := w.storeRows(s, rows)
@@ -1254,42 +1381,156 @@ func (w *garminWalker) walkPerDay(ctx context.Context, s garminSeries) garminSer
 			return out
 		}
 		out.stored += stored
-		st.TotalRows += stored
-		if len(rows) > 0 {
-			o, n := dayRange(rows)
-			oldest = minDay(oldest, o)
-			newest = maxDay(newest, n)
+		// The bookmark advances over a requested day whether or not it
+		// carried data: a day asked for and answered empty is filled, and
+		// re-asking it every run would cost one request per empty day
+		// forever.
+		if !extension && !forwardBroken {
+			st.LastCompleteDay = maxDay(mustDay(st.LastCompleteDay), minDay(day, ceiling)).String()
+			if saveErr := w.db.SaveGarminSeriesState(st); saveErr != nil {
+				out.errored, out.err = true, saveErr
+				return out
+			}
 		}
-		w.emit.progress(s.name, stored, day.String())
-		// Newest-first means the bookmark can only advance once the whole
-		// contiguous run down to `from` is done; checkpoint the frontier
-		// instead, so a killed run resumes without re-fetching.
-		st.FrontierDay = day.String()
-		if !oldest.isZero() {
-			st.EarliestDay = oldest.String()
+		w.emit.progress(s.name, stored, day.String(), st.LastCompleteDay)
+	}
+
+	// The same rule as the windowed walk: a floor above the newest complete
+	// day is not a range, so nothing is stamped from it.
+	if !work.coverFrom.isZero() && !work.coverFrom.after(ceiling) {
+		if !extBroken {
+			st.EarliestDay = minDay(mustDay(st.EarliestDay), work.coverFrom).String()
 		}
-		if saveErr := w.db.SaveGarminSeriesState(st); saveErr != nil {
-			out.errored, out.err = true, saveErr
-			return out
+		if !forwardBroken {
+			// Every signal day up to yesterday has now been asked for, so
+			// the gaps between them are filled too.
+			st.LastCompleteDay = maxDay(mustDay(st.LastCompleteDay), ceiling).String()
 		}
 	}
-	if !newest.isZero() {
-		st.LastCompleteDay = minDay(newest, ceiling).String()
+	if forwardBroken || extBroken {
+		st.StopReason = "interrupted"
+	} else {
+		st.StopReason = ""
 	}
-	if saveErr := w.db.SaveGarminSeriesState(st); saveErr != nil {
-		out.errored, out.err = true, saveErr
-		return out
-	}
-	w.mirrorSyncState(s.name, st)
+	w.finishSeries(s, st, &out)
 	return out
 }
 
-// walkActivities pages the activity feed.
+// garminActivityFeedPath is the activity feed endpoint.
+const garminActivityFeedPath = "/activitylist-service/activities/search/activities"
+
+// feedFloor asks Garmin for the account's oldest activity in one request. It
+// is the activity feed's floor: there is nothing to walk below it, and unlike
+// a wellness series the feed can answer the question directly.
+func (w *garminWalker) feedFloor(ctx context.Context) (civilDay, error) {
+	data, err := w.get(ctx, garminActivityFeedPath, map[string]string{
+		"sortOrder": "asc", "start": "0", "limit": "1",
+	})
+	if err != nil {
+		return civilDay{}, err
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(data, &items); err != nil || len(items) == 0 {
+		return civilDay{}, nil
+	}
+	day, _ := dayFromValue(jsonStringField(items[0], garminActivityDayField))
+	return day, nil
+}
+
+// pageFeed pages one date range of the activity feed, oldest first.
 //
-// The wire parameter is `start`, not `offset`: verified live 2026-09-07 by
-// requesting start=5 and offset=5 against the same account — start=5 returned
-// the sixth-newest activity onward, offset=5 returned the same page as
-// start=0, i.e. Garmin ignores `offset` entirely.
+// The wire parameter for the offset is `start`, not `offset`: verified live
+// 2026-09-07 by requesting start=5 and offset=5 against the same account —
+// start=5 returned the sixth activity onward, offset=5 returned the same page
+// as start=0, i.e. Garmin ignores `offset` entirely. The order parameter is
+// `sortOrder=asc`, probed live 2026-09-13 on both reference homes, with and
+// without a date range.
+//
+// The offset counts from zero WITHIN the range rather than from the rows
+// already stored: once a fill can be bounded by dates, a stored-row count is
+// not an offset into anything the server would return.
+func (w *garminWalker) pageFeed(ctx context.Context, s garminSeries, from, to civilDay, forward bool, ceiling civilDay, st *store.GarminSeriesState, out *garminSeriesOutcome) (bool, error) {
+	limit := w.opts.activityPageSize
+	if limit < 1 {
+		limit = 100
+	}
+	offset, pages := 0, 0
+	for {
+		if w.opts.maxPages > 0 && pages >= w.opts.maxPages {
+			out.warned = true
+			w.emit.warn(s.name, "max_pages_cap_hit",
+				fmt.Sprintf("reached --max-pages cap of %d; the feed may be truncated. Re-run to continue.", w.opts.maxPages))
+			return false, nil
+		}
+		params := map[string]string{
+			"start":     strconv.Itoa(offset),
+			"limit":     strconv.Itoa(limit),
+			"sortOrder": "asc",
+		}
+		if !from.isZero() {
+			params["startDate"] = from.String()
+		}
+		if !to.isZero() {
+			params["endDate"] = to.String()
+		}
+		data, callErr := w.get(ctx, garminActivityFeedPath, params)
+		if callErr != nil {
+			if isWalkAborted(callErr) {
+				return false, callErr
+			}
+			out.warned = true
+			w.emit.warn(s.name, "page_fetch_failed", fmt.Sprintf("start=%d: %v", offset, callErr))
+			return false, nil
+		}
+		var items []json.RawMessage
+		if err := json.Unmarshal(data, &items); err != nil {
+			out.warned = true
+			w.emit.anomaly(s.name, "page_shape_unrecognized", 0, 0)
+			return false, nil
+		}
+		pages++
+		rows := make([]garminRow, 0, len(items))
+		newest := civilDay{}
+		for _, item := range items {
+			id := activityIDOf(item)
+			if id == "" {
+				continue
+			}
+			day, _ := dayFromValue(jsonStringField(item, garminActivityDayField))
+			newest = maxDay(newest, day)
+			rows = append(rows, garminRow{id: id, day: day, data: item})
+		}
+		stored, storeErr := w.storeRows(s, rows)
+		if storeErr != nil {
+			return false, storeErr
+		}
+		out.stored += stored
+		if forward {
+			if !newest.isZero() {
+				st.LastCompleteDay = maxDay(mustDay(st.LastCompleteDay), minDay(newest, ceiling)).String()
+			}
+			// Same rule as every other walk: a floor above the newest
+			// complete day is not a range, so nothing is stamped from it.
+			if !from.after(ceiling) {
+				st.EarliestDay = minDay(mustDay(st.EarliestDay), from).String()
+			}
+			if saveErr := w.db.SaveGarminSeriesState(*st); saveErr != nil {
+				return false, saveErr
+			}
+		}
+		w.emit.progress(s.name, stored, fmt.Sprintf("start=%d", offset), st.LastCompleteDay)
+		if len(items) < limit {
+			return true, nil
+		}
+		offset += limit
+	}
+}
+
+// walkActivities pages the activity feed oldest first, in the same two legs as
+// every other series: an extension below the filled range when this run asks
+// for one, then forward from the bookmark. The forward leg re-requests the
+// bookmark day itself, which is free — rows upsert — and is what keeps an
+// activity added late on that day from being missed.
 func (w *garminWalker) walkActivities(ctx context.Context, s garminSeries) garminSeriesOutcome {
 	out := garminSeriesOutcome{series: s.name}
 	st, err := w.db.GetGarminSeriesState(s.name)
@@ -1297,102 +1538,77 @@ func (w *garminWalker) walkActivities(ctx context.Context, s garminSeries) garmi
 		out.errored, out.err = true, err
 		return out
 	}
-	limit := w.opts.activityPageSize
-	if limit < 1 {
-		limit = 100
-	}
-	floor := civilDay{}
-	if !w.opts.backfill {
-		// Incremental: stop once the feed reaches a day already complete,
-		// and on a first run stop at the --days horizon rather than pulling
-		// the whole feed. Without that clamp a bare `history` would quietly
-		// walk one series back to the account's first activity while every
-		// other series covered --days, which is not what the flag says.
-		horizon := today(w.opts.now, w.opts.loc).addDays(-(w.opts.days - 1))
-		floor = maxDay(mustDay(st.LastCompleteDay), horizon)
-	}
+	st = garminResumableState(st)
+	now := today(w.opts.now, w.opts.loc)
+	ceiling := completeDayCeiling(now)
+	filled := garminSeriesFilled(st)
+	w.noticeShallowSince(st)
 
-	newest := civilDay{}
-	oldest := mustDay(st.EarliestDay)
-	offset := 0
-	pages := 0
-	for {
-		if w.opts.maxPages > 0 && pages >= w.opts.maxPages {
-			out.warned = true
-			w.emit.warn(s.name, "max_pages_cap_hit",
-				fmt.Sprintf("reached --max-pages cap of %d; the feed may be truncated. Re-run with a higher --max-pages to go further back.", w.opts.maxPages))
-			break
+	floor := civilDay{}
+	switch w.opts.depth.mode {
+	case depthFrom:
+		floor = w.opts.depth.day
+	case depthStored:
+		if filled {
+			floor = mustDay(st.EarliestDay)
 		}
-		data, callErr := w.get(ctx, "/activitylist-service/activities/search/activities", map[string]string{
-			"start": strconv.Itoa(offset),
-			"limit": strconv.Itoa(limit),
-		})
-		if callErr != nil {
-			if isWalkAborted(callErr) {
-				out.errored, out.err = true, callErr
+	}
+	if floor.isZero() {
+		probed, probeErr := w.feedFloor(ctx)
+		if probeErr != nil {
+			if isWalkAborted(probeErr) {
+				out.errored, out.err = true, probeErr
 				return out
 			}
 			out.warned = true
-			w.emit.warn(s.name, "page_fetch_failed", fmt.Sprintf("start=%d: %v", offset, callErr))
-			break
-		}
-		var items []json.RawMessage
-		if err := json.Unmarshal(data, &items); err != nil {
-			out.warned = true
-			w.emit.anomaly(s.name, "page_shape_unrecognized", 0, 0)
-			break
-		}
-		pages++
-		rows := make([]garminRow, 0, len(items))
-		reachedFloor := false
-		for _, item := range items {
-			id := activityIDOf(item)
-			if id == "" {
-				continue
-			}
-			day, _ := dayFromValue(jsonStringField(item, "startTimeLocal"))
-			if !floor.isZero() && !day.isZero() && day.before(floor) {
-				reachedFloor = true
-				continue
-			}
-			rows = append(rows, garminRow{id: id, day: day, data: item})
-		}
-		stored, storeErr := w.storeRows(s, rows)
-		if storeErr != nil {
-			out.errored, out.err = true, storeErr
+			w.emit.warn(s.name, "feed_floor_fetch_failed", probeErr.Error())
 			return out
 		}
-		out.stored += stored
-		st.TotalRows += stored
-		o, n := dayRange(rows)
-		oldest = minDay(oldest, o)
-		newest = maxDay(newest, n)
-		w.emit.progress(s.name, stored, fmt.Sprintf("start=%d", offset))
+		if probed.isZero() {
+			// The feed answered, and this account has never recorded an
+			// activity. There is nothing to page.
+			w.finishSeries(s, st, &out)
+			return out
+		}
+		floor = probed
+	}
 
-		if !oldest.isZero() {
-			st.EarliestDay = oldest.String()
+	// --- extension leg.
+	if filled {
+		earliest := mustDay(st.EarliestDay)
+		if floor.before(earliest) {
+			complete, fatal := w.pageFeed(ctx, s, floor, earliest.addDays(-1), false, ceiling, &st, &out)
+			if fatal != nil {
+				out.errored, out.err = true, fatal
+				return out
+			}
+			if complete {
+				st.EarliestDay = minDay(earliest, floor).String()
+				if saveErr := w.db.SaveGarminSeriesState(st); saveErr != nil {
+					out.errored, out.err = true, saveErr
+					return out
+				}
+			}
 		}
-		st.FrontierDay = oldest.String()
-		if saveErr := w.db.SaveGarminSeriesState(st); saveErr != nil {
-			out.errored, out.err = true, saveErr
-			return out
-		}
-		if reachedFloor || len(items) < limit {
-			break
-		}
-		offset += limit
 	}
-	if !newest.isZero() {
-		st.LastCompleteDay = minDay(newest, completeDayCeiling(today(w.opts.now, w.opts.loc))).String()
+
+	// --- forward leg.
+	from := floor
+	if filled {
+		from = mustDay(st.LastCompleteDay)
 	}
-	if w.opts.backfill {
-		st.StopReason = "feed_exhausted"
-	}
-	if saveErr := w.db.SaveGarminSeriesState(st); saveErr != nil {
-		out.errored, out.err = true, saveErr
+	complete, fatal := w.pageFeed(ctx, s, from, civilDay{}, true, ceiling, &st, &out)
+	if fatal != nil {
+		out.errored, out.err = true, fatal
 		return out
 	}
-	w.mirrorSyncState(s.name, st)
+	if complete {
+		st.LastCompleteDay = maxDay(mustDay(st.LastCompleteDay), ceiling).String()
+		st.StopReason = "feed_exhausted"
+	} else {
+		st.StopReason = "interrupted"
+	}
+	w.finishSeries(s, st, &out)
 	return out
 }
 
@@ -1489,7 +1705,7 @@ func (w *garminWalker) walkPerParent(ctx context.Context, s garminSeries) garmin
 		w.emit.warn(s.name, "max_dependents_cap_hit",
 			fmt.Sprintf("stopped after %d %s; re-run to continue, or raise --max-dependents", w.opts.maxDependents, s.parentResource))
 	}
-	w.emit.progress(s.name, out.stored, fmt.Sprintf("%d pending", outstanding-out.stored))
+	w.emit.progress(s.name, out.stored, fmt.Sprintf("%d pending", outstanding-out.stored), "")
 	w.mirrorSyncState(s.name, st)
 	return out
 }
@@ -1542,7 +1758,7 @@ func (w *garminWalker) walkSingleDocument(ctx context.Context, s garminSeries) g
 		out.errored, out.err = true, saveErr
 		return out
 	}
-	w.emit.progress(s.name, out.stored, s.docID)
+	w.emit.progress(s.name, out.stored, s.docID, "")
 	w.mirrorSyncState(s.name, st)
 	return out
 }
@@ -1551,10 +1767,7 @@ func (w *garminWalker) walkSeries(ctx context.Context, s garminSeries) garminSer
 	var out garminSeriesOutcome
 	switch s.kind {
 	case seriesWindowed:
-		// walkWindowed carries its own never-returned-data reporting,
-		// because there the silence also decides whether earliest_day may
-		// be stamped.
-		return w.walkWindowed(ctx, s)
+		out = w.walkWindowed(ctx, s)
 	case seriesPerDay:
 		out = w.walkPerDay(ctx, s)
 	case seriesOffsetPaged:
@@ -1581,20 +1794,8 @@ func (w *garminWalker) walkSeries(ctx context.Context, s garminSeries) garminSer
 }
 
 // ---------------------------------------------------------------------------
-// Plan (used by --dry-run and by the performance test)
+// Kind names
 // ---------------------------------------------------------------------------
-
-// garminPlanEntry is what one series will cost, in requests, for a given
-// forward range. It exists so the shape of the walk can be asserted without
-// making a single call.
-type garminPlanEntry struct {
-	Series     string `json:"series"`
-	Kind       string `json:"kind"`
-	Requests   int    `json:"requests"`
-	WindowDays int    `json:"window_days,omitempty"`
-	Range      string `json:"range,omitempty"`
-	Note       string `json:"note,omitempty"`
-}
 
 func kindName(k garminSeriesKind) string {
 	switch k {
@@ -1612,48 +1813,100 @@ func kindName(k garminSeriesKind) string {
 	return "unknown"
 }
 
-// planGarminForwardWork reports the request cost of a forward (incremental)
-// run covering the last `days` days ending at `end`.
-func planGarminForwardWork(selected []garminSeries, end civilDay, days int) []garminPlanEntry {
-	from := end.addDays(-(days - 1))
-	out := make([]garminPlanEntry, 0, len(selected))
-	for _, s := range selected {
-		entry := garminPlanEntry{Series: s.name, Kind: kindName(s.kind)}
-		switch s.kind {
-		case seriesWindowed:
-			windows := planForwardWindows(from, end, s.windowDays)
-			entry.Requests = len(windows)
-			entry.WindowDays = s.windowDays
-			entry.Range = from.String() + ".." + end.String()
-		case seriesPerDay:
-			entry.Requests = len(enumerateDaysNewestFirst(from, end))
-			entry.Range = from.String() + ".." + end.String()
-			entry.Note = "one request per calendar day"
-		case seriesOffsetPaged:
-			entry.Requests = -1
-			entry.Note = "pages until the feed reaches an already-complete day"
-		case seriesPerParent:
-			entry.Requests = -1
-			entry.Note = "one request per " + s.parentNoun + " that has no row in this series yet"
-		case seriesSingleDocument:
-			entry.Requests = 1
-			entry.Note = "one request for the whole account; the single row is replaced in place"
-		}
-		out = append(out, entry)
-	}
-	return out
-}
-
 // ---------------------------------------------------------------------------
 // Command
 // ---------------------------------------------------------------------------
 
+// garminParseDepth turns --since into the three states the walk distinguishes.
+func garminParseDepth(raw string) (garminDepth, error) {
+	switch strings.TrimSpace(strings.ToLower(raw)) {
+	case "":
+		return garminDepth{mode: depthStored}, nil
+	case "all":
+		return garminDepth{mode: depthAll}, nil
+	}
+	day, err := parseCivilDay(strings.TrimSpace(raw))
+	if err != nil {
+		return garminDepth{}, fmt.Errorf("--since takes either `all` or a date in YYYY-MM-DD form; %q is neither", raw)
+	}
+	return garminDepth{mode: depthFrom, day: day}, nil
+}
+
+// garminSelectSeries resolves --series, defaulting to the whole catalog.
+func garminSelectSeries(seriesFlag []string) ([]garminSeries, error) {
+	if len(seriesFlag) == 0 {
+		return garminSeriesCatalog(), nil
+	}
+	catalog := garminSeriesByName()
+	var selected []garminSeries
+	for _, raw := range seriesFlag {
+		for _, name := range strings.Split(raw, ",") {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			s, ok := catalog[name]
+			if !ok {
+				return nil, fmt.Errorf("unknown series %q; known series: %s", name, strings.Join(garminSeriesNames(), ", "))
+			}
+			selected = append(selected, s)
+		}
+	}
+	if len(selected) == 0 {
+		return nil, errors.New("no series selected")
+	}
+	return selected, nil
+}
+
+// garminPlanAll plans every selected series against the archive.
+func garminPlanAll(planner *garminPlanner, selected []garminSeries) ([]garminSeriesPlan, error) {
+	out := make([]garminSeriesPlan, 0, len(selected))
+	for _, s := range selected {
+		plan, err := planner.seriesPlan(s)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, plan)
+	}
+	return out, nil
+}
+
+// garminOutstandingCell renders a request count for --dry-run, whose column
+// is what this run would cost. Only the feed's count is unknowable, and it is
+// named rather than abbreviated to "variable", which is vocabulary from the
+// implementation rather than from the question the caller asked.
+func garminOutstandingCell(n int) string {
+	if n < 0 {
+		return "pages until the feed ends"
+	}
+	return strconv.Itoa(n)
+}
+
+// garminStatusOutstandingCell renders the same number for --status, where the
+// column means outstanding WORK. A caught-up series still owes today's window
+// and its refresh days every run, which is maintenance rather than debt, so a
+// series complete through the newest complete day reads as up to date.
+func garminStatusOutstandingCell(p garminSeriesPlan, ceiling civilDay) string {
+	if p.Outstanding < 0 {
+		return "pages until the feed ends"
+	}
+	// A single-document series is the account's current setting rather than a
+	// dated observation: it is replaced in place every run, so its one
+	// request is maintenance once the archive holds the document at all.
+	if p.Kind == kindName(seriesSingleDocument) && p.Rows > 0 {
+		return "up to date"
+	}
+	if p.Outstanding == 0 || p.LastComplete == ceiling.String() {
+		return "up to date"
+	}
+	return strconv.Itoa(p.Outstanding)
+}
+
 func newGarminHistoryCmd(flags *rootFlags) *cobra.Command {
 	var (
 		seriesFlag             []string
-		days                   int
-		backfill               bool
-		emptyWindowCeiling     int
+		since                  string
+		status                 bool
 		delay                  time.Duration
 		maxPages               int
 		maxDependents          int
@@ -1665,71 +1918,52 @@ func newGarminHistoryCmd(flags *rootFlags) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "history",
-		Short: "Walk Garmin's date-ranged daily series into the local archive",
+		Short: "Build and maintain the local archive of your Garmin history",
 		Long: `Build and maintain the local archive of Garmin's daily series.
 
 Garmin serves daily statistics from date-range endpoints that accept at most
 28 calendar days per request, and per-day endpoints that answer for exactly
-one date. Neither shape can be enumerated by the generated ` + "`sync`" + `, so this
-command owns the calendar walk: it fetches forward from wherever each series
-left off, and under --backfill walks backwards a window at a time until it
-has seen enough consecutive empty windows to conclude the account's history
-has run out.
+one date, so this command owns the calendar walk: every series is walked from
+its oldest day forward, and each keeps one bookmark saying how far it is
+complete. Interrupting a run is safe — the next run continues from the
+bookmark rather than starting again.
 
-State is per series: the newest day known complete, the oldest day the archive
-reaches, the oldest day probed, and why the last backward walk stopped. Today
-is never recorded as complete, because the day is still accruing.
+How far back to go is the one choice: --since all fetches everything the
+account holds, --since YYYY-MM-DD starts there instead. With neither, a series
+that already has history keeps the depth it has and only catches up to today.
+A later, deeper --since extends the archive downward without re-fetching what
+is already stored.
 
-Series that answer one day per request (daily_summary, sleep_detail, daily_hr,
-training_readiness) are bounded by --days rather than walked to the ceiling;
-one night of sleep_detail is roughly 95 KB, so deep history there is an
-explicit choice, not a default.`,
+Before the expensive part of a run — the per-activity and per-day fetches —
+the command prints what it is about to cost in requests, time and disk.
+--dry-run prints that without making a single call, and --status reports what
+each series already holds.`,
 		Example: `  # Catch up every series since the last run
   garmin-pp-cli history
 
-  # First run on a new account: walk the full history of the ranged series
-  garmin-pp-cli history --backfill
+  # First fill: everything this account has
+  garmin-pp-cli history --since all
 
-  # Just the last eight weeks of the heavy per-day series
-  garmin-pp-cli history --series daily_summary,sleep_detail,daily_hr --days 56
+  # Just this summer
+  garmin-pp-cli history --since 2026-06-01
 
-  # See what a run would cost without making a call
-  garmin-pp-cli history --backfill --dry-run --json`,
+  # What is already archived, and what a run would cost
+  garmin-pp-cli history --status
+  garmin-pp-cli history --since all --dry-run`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) > 0 {
-				return usageErr(fmt.Errorf("history takes no positional arguments; use --series to choose series"))
+				return usageErr(fmt.Errorf("history takes no positional arguments; use --since to choose how far back to fetch"))
 			}
-			if days < 1 {
-				return usageErr(fmt.Errorf("--days must be at least 1"))
-			}
-			if emptyWindowCeiling < 1 {
-				return usageErr(fmt.Errorf("--empty-window-ceiling must be at least 1"))
+			depth, err := garminParseDepth(since)
+			if err != nil {
+				return usageErr(err)
 			}
 			if delay < 0 {
 				return usageErr(fmt.Errorf("--delay cannot be negative"))
 			}
-
-			catalog := garminSeriesByName()
-			var selected []garminSeries
-			if len(seriesFlag) == 0 {
-				selected = garminSeriesCatalog()
-			} else {
-				for _, raw := range seriesFlag {
-					for _, name := range strings.Split(raw, ",") {
-						name = strings.TrimSpace(name)
-						if name == "" {
-							continue
-						}
-						s, ok := catalog[name]
-						if !ok {
-							return usageErr(fmt.Errorf("unknown series %q; known series: %s", name, strings.Join(garminSeriesNames(), ", ")))
-						}
-						selected = append(selected, s)
-					}
-				}
-			}
-			if len(selected) == 0 {
-				return usageErr(fmt.Errorf("no series selected"))
+			selected, err := garminSelectSeries(seriesFlag)
+			if err != nil {
+				return usageErr(err)
 			}
 
 			machine := wantsMachineOutput(flags)
@@ -1737,38 +1971,7 @@ explicit choice, not a default.`,
 			if machine {
 				eventWriter = cmd.ErrOrStderr()
 			}
-			emit := &garminEmitter{w: eventWriter, machine: machine}
-
-			now := time.Now
-			end := today(now, time.Local)
-
-			if flags.dryRun {
-				plan := planGarminForwardWork(selected, end, days)
-				if flags.asJSON {
-					return flags.printJSON(cmd, map[string]any{
-						"plan":                 plan,
-						"days":                 days,
-						"backfill":             backfill,
-						"empty_window_ceiling": emptyWindowCeiling,
-						"delay_ms":             delay.Milliseconds(),
-					})
-				}
-				rows := make([][]string, 0, len(plan))
-				for _, p := range plan {
-					requests := strconv.Itoa(p.Requests)
-					if p.Requests < 0 {
-						requests = "variable"
-					}
-					rows = append(rows, []string{p.Series, p.Kind, requests, p.Range, p.Note})
-				}
-				return flags.printTable(cmd, []string{"SERIES", "KIND", "REQUESTS", "RANGE", "NOTE"}, rows)
-			}
-
-			c, err := flags.newClient()
-			if err != nil {
-				return err
-			}
-			c.NoCache = true
+			emit := &garminEmitter{w: eventWriter, machine: machine, noteW: cmd.ErrOrStderr()}
 
 			if dbPath == "" {
 				dbPath = garminArchivePath(cmd.Context(), cmd.ErrOrStderr())
@@ -1782,14 +1985,35 @@ explicit choice, not a default.`,
 				return err
 			}
 
+			now := time.Now
+			planner := &garminPlanner{
+				db: db, depth: depth, now: now, loc: time.Local,
+				delay: delay, maxDependents: maxDependents,
+			}
+
+			// --status and --dry-run both answer from the archive alone.
+			// Neither builds a client, so "no traffic" is a property of the
+			// code path rather than a promise about it.
+			if status {
+				return garminPrintStatus(cmd, flags, planner, selected)
+			}
+			if flags.dryRun {
+				return garminPrintDryRun(cmd, flags, planner, selected, delay)
+			}
+
+			c, err := flags.newClient()
+			if err != nil {
+				return err
+			}
+			c.NoCache = true
+
 			walker := &garminWalker{
-				client: c,
-				db:     db,
-				emit:   emit,
+				client:  c,
+				db:      db,
+				emit:    emit,
+				planner: planner,
 				opts: garminWalkOptions{
-					days:                   days,
-					backfill:               backfill,
-					emptyWindowCeiling:     emptyWindowCeiling,
+					depth:                  depth,
 					delay:                  delay,
 					maxPages:               maxPages,
 					maxDependents:          maxDependents,
@@ -1805,7 +2029,18 @@ explicit choice, not a default.`,
 			started := time.Now()
 			var total, success, warned, errored int
 			var firstErr error
+			estimated := false
 			for _, s := range selected {
+				// The estimate lands once, after the cheap series have
+				// filled the archive this run reads its numbers from, and
+				// before the first request that could take hours.
+				if !estimated && garminIsExpensiveKind(s.kind) {
+					estimated = true
+					planner.signalLoaded = false
+					if plans, planErr := garminPlanAll(planner, garminExpensiveSeries(selected)); planErr == nil {
+						emit.estimate(garminEstimateOf(plans, depth, delay))
+					}
+				}
 				emit.start(s.name)
 				outcome := walker.walkSeries(cmd.Context(), s)
 				total += outcome.stored
@@ -1843,27 +2078,97 @@ explicit choice, not a default.`,
 		},
 	}
 
+	cmd.Flags().StringVar(&since, "since", "",
+		"How far back to fetch: the word all for everything this account holds, or a date (YYYY-MM-DD). "+
+			"Without it, a series that already has history keeps its depth and only catches up to today.")
+	cmd.Flags().BoolVar(&status, "status", false,
+		"Report what each series already holds and what it still owes, without making a request.")
+
+	// Mechanism flags. They stay functional — an escape hatch is worth
+	// having when a run meets something nobody predicted — but they are
+	// hidden, because every one of them is an implementation detail leaking
+	// into a choice the caller should not have to make (N131 decision D12).
 	cmd.Flags().StringSliceVar(&seriesFlag, "series", nil,
 		"Series to walk (comma-separated). Default: every series. Known: "+strings.Join(garminSeriesNames(), ", "))
-	cmd.Flags().IntVar(&days, "days", 28,
-		"How many recent days a forward run covers, and the full depth of the one-request-per-day series.")
-	cmd.Flags().BoolVar(&backfill, "backfill", false,
-		"Also walk the date-ranged series backwards through history until the empty-window ceiling is reached.")
-	cmd.Flags().IntVar(&emptyWindowCeiling, "empty-window-ceiling", 13,
-		"How many consecutive empty windows end a backward walk. 13 windows of 28 days is about a year of silence.")
 	cmd.Flags().DurationVar(&delay, "delay", 300*time.Millisecond,
-		"Pause between API calls. The default paced a 94-window live backfill without a single 429.")
+		"Pause between API calls. The default paced a 94-window live fill without a single 429.")
 	cmd.Flags().IntVar(&maxPages, "max-pages", 0,
-		"Cap on activity-feed pages (0 = until the feed ends or reaches an already-complete day).")
-	cmd.Flags().IntVar(&maxDependents, "max-dependents", 500,
+		"Cap on activity-feed pages per leg (0 = until the feed ends).")
+	cmd.Flags().IntVar(&maxDependents, "max-dependents", 0,
 		"Cap on per-activity fetches per fan-out series — heart-rate zones, detail, splits — in one run (0 = no cap).")
 	cmd.Flags().IntVar(&pageSize, "page-size", 100, "Activity-feed page size.")
 	cmd.Flags().BoolVar(&strict, "strict", false, "Exit non-zero when any series fails. By default a failed series warns and the run continues.")
 	cmd.Flags().IntVar(&maxConsecutiveFailures, "max-consecutive-failures", defaultMaxConsecutiveFailures,
 		"End the run when this many requests fail in a row. A whole run failing usually means the credential stopped being accepted or the service is refusing this client, not that these requests were unlucky.")
 	cmd.Flags().StringVar(&dbPath, "db", "", "SQLite database file path. The default is this home's data directory data.db, which is named for the home rather than for the credential in use, so a token refresh never orphans it; pass --db to read or write a different file.")
+	for _, hidden := range []string{"series", "delay", "max-pages", "max-dependents", "page-size", "strict", "max-consecutive-failures", "db"} {
+		if err := cmd.Flags().MarkHidden(hidden); err != nil {
+			panic("history: " + err.Error())
+		}
+	}
 
 	return cmd
+}
+
+// garminIsExpensiveKind marks the series shapes whose cost is worth warning
+// about before they start: one request per activity, and one per day.
+func garminIsExpensiveKind(k garminSeriesKind) bool {
+	return k == seriesPerParent || k == seriesPerDay
+}
+
+func garminExpensiveSeries(selected []garminSeries) []garminSeries {
+	var out []garminSeries
+	for _, s := range selected {
+		if garminIsExpensiveKind(s.kind) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// garminPrintStatus reports each series' filled range and outstanding work.
+func garminPrintStatus(cmd *cobra.Command, flags *rootFlags, planner *garminPlanner, selected []garminSeries) error {
+	plans, err := garminPlanAll(planner, selected)
+	if err != nil {
+		return err
+	}
+	if flags.asJSON {
+		return flags.printJSON(cmd, map[string]any{"series": plans})
+	}
+	rows := make([][]string, 0, len(plans))
+	for _, p := range plans {
+		rows = append(rows, []string{
+			p.Series, strconv.Itoa(p.Rows), p.Earliest, p.LastComplete,
+			garminStatusOutstandingCell(p, planner.ceiling()), p.StopReason,
+		})
+	}
+	return flags.printTable(cmd,
+		[]string{"SERIES", "ROWS", "FILLED FROM", "COMPLETE THROUGH", "OUTSTANDING", "STOPPED BECAUSE"}, rows)
+}
+
+// garminPrintDryRun reports what a run would cost without making one request.
+func garminPrintDryRun(cmd *cobra.Command, flags *rootFlags, planner *garminPlanner, selected []garminSeries, delay time.Duration) error {
+	plans, err := garminPlanAll(planner, selected)
+	if err != nil {
+		return err
+	}
+	est := garminEstimateOf(plans, planner.depth, delay)
+	if flags.asJSON {
+		return flags.printJSON(cmd, map[string]any{
+			"plan":     plans,
+			"estimate": est,
+			"delay_ms": delay.Milliseconds(),
+		})
+	}
+	rows := make([][]string, 0, len(plans))
+	for _, p := range plans {
+		rows = append(rows, []string{p.Series, p.Kind, garminOutstandingCell(p.Outstanding), p.Since, p.Note})
+	}
+	if err := flags.printTable(cmd, []string{"SERIES", "KIND", "REQUESTS", "SINCE", "NOTE"}, rows); err != nil {
+		return err
+	}
+	fmt.Fprintln(cmd.ErrOrStderr(), est.line())
+	return nil
 }
 
 // ---------------------------------------------------------------------------

@@ -239,7 +239,7 @@ func RegisterTools(s *server.MCPServer) {
 	)
 	s.AddTool(
 		mcplib.NewTool("sleep_stats",
-			mcplib.WithDescription("One row per night between `start` and `end`, aggregated by Garmin. At most 28 calendar days per request; `history` walks longer ranges backwards in 28-day windows into the local archive and de-duplicates on the calendar date. Rows arrive under `individualStats`. Required: start, end. Optional: DI-Backend (default: connectapi.garmin.com). Returns array of SleepStatsDay."),
+			mcplib.WithDescription("One row per night between `start` and `end`, aggregated by Garmin. At most 28 calendar days per request; `history` fills longer ranges into the local archive in 28-day windows, oldest day first, de-duplicating on the calendar date. Rows arrive under `individualStats`. Required: start, end. Optional: DI-Backend (default: connectapi.garmin.com). Returns array of SleepStatsDay."),
 			mcplib.WithString("DI-Backend", mcplib.Description("Request header used only by Garmin's older cookie-based auth path.")),
 			mcplib.WithString("start", mcplib.Required(), mcplib.Description("Inclusive start date, YYYY-MM-DD.")),
 			mcplib.WithString("end", mcplib.Required(), mcplib.Description("Inclusive end date, YYYY-MM-DD.")),
@@ -251,7 +251,7 @@ func RegisterTools(s *server.MCPServer) {
 	)
 	s.AddTool(
 		mcplib.NewTool("steps_daily",
-			mcplib.WithDescription("One row per calendar date with total steps, the step goal and the distance walked. At most 28 calendar days per request; `history` walks longer ranges in 28-day windows into the local archive. Required: start, end. Optional: DI-Backend (default: connectapi.garmin.com). Returns array of DailyStepsDay."),
+			mcplib.WithDescription("One row per calendar date with total steps, the step goal and the distance walked. At most 28 calendar days per request; `history` fills longer ranges into the local archive in 28-day windows, oldest day first. Required: start, end. Optional: DI-Backend (default: connectapi.garmin.com). Returns array of DailyStepsDay."),
 			mcplib.WithString("DI-Backend", mcplib.Description("Request header used only by Garmin's older cookie-based auth path.")),
 			mcplib.WithString("start", mcplib.Required(), mcplib.Description("Inclusive start date, YYYY-MM-DD.")),
 			mcplib.WithString("end", mcplib.Required(), mcplib.Description("Inclusive end date, YYYY-MM-DD.")),
@@ -1298,11 +1298,11 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 		// to the companion CLI binary.
 		"command_mirror_capabilities": []map[string]string{
 			{"name": "Loopback browser login with identity assertion", "command": "auth login", "description": "Signs in through Garmin's own page in your browser, catches the redirect on a loopback port", "rationale": "Every other client either takes your password or scrapes a browser cookie", "via": "mcp-command-mirror"},
-			{"name": "Windowed backfill of the 28-day-capped series", "command": "history", "description": "Walks every daily-stats series backwards in 28-day windows into a local SQLite archive and resumes where it stopped.", "rationale": "Garmin caps every daily-stats request at 28 days, so years of history exist only if something walks and stores them.", "via": "mcp-command-mirror"},
+			{"name": "Oldest-first archive fill of the 28-day-capped series", "command": "history", "description": "Fills every daily-stats series into a local SQLite archive from the oldest day forward, one bookmark per series, so an interrupted run continues where it stopped.", "rationale": "Garmin caps every daily-stats request at 28 days, so years of history exist only if something walks and stores them, and a fill that costs hours has to say so before it starts.", "via": "mcp-command-mirror"},
 		},
 		"playbook": []map[string]string{
 			{"topic": "Loopback browser login with identity assertion", "insight": "Every other client either takes your password or scrapes a browser cookie; a shared browser session silently signs in the wrong household member, and only an identity check catches it."},
-			{"topic": "Windowed backfill of the 28-day-capped series", "insight": "Garmin caps every daily-stats request at 28 days, so years of history exist only if something walks and stores them."},
+			{"topic": "Oldest-first archive fill of the 28-day-capped series", "insight": "Garmin caps every daily-stats request at 28 days, so years of history exist only if something walks and stores them; `history --since all` fills from the oldest day forward and `history --status` says how far it got."},
 			{"topic": "Contact lookup", "insight": "Use search for finding contacts by name/email. List endpoints return unsorted results and require pagination for large datasets."},
 			{"topic": "Activity tracking", "insight": "When checking deal activity, sync first and query locally. CRM APIs often throttle activity-log endpoints heavily."},
 		},

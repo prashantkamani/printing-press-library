@@ -73,11 +73,11 @@
       "group": "Auth you can trust with a household"
     },
     {
-      "name": "Windowed backfill of the 28-day-capped series",
+      "name": "Oldest-first archive fill of the 28-day-capped series",
       "command": "history",
-      "description": "Walks the date-ranged daily-stats series backwards into a local SQLite archive and resumes where it stopped — 28-day windows where Garmin caps a request at 28 days, 364-day windows where it does not, and one request per day for the per-day series.",
-      "rationale": "Garmin caps every daily-stats request at 28 days, so years of history exist only if something walks and stores them.",
-      "example": "garmin-pp-cli history --backfill",
+      "description": "Fills a local SQLite archive from the oldest day forward, one bookmark per series, so an interrupted run continues where it stopped — 28-day windows where Garmin caps a request at 28 days, 364-day windows where it does not, and one request per day for the per-day series, asked only for days something was recorded.",
+      "rationale": "Garmin caps every daily-stats request at 28 days, so years of history exist only if something walks and stores them — and a fill that costs hours has to say so before it starts.",
+      "example": "garmin-pp-cli history --since all --dry-run",
       "why_it_matters": "Run this before any trend question; every analytics command reads the archive, not the API.",
       "group": "Local state that compounds"
     }
@@ -93,11 +93,11 @@
       "group": "Auth you can trust with a household"
     },
     {
-      "name": "Windowed backfill of the 28-day-capped series",
+      "name": "Oldest-first archive fill of the 28-day-capped series",
       "command": "history",
-      "description": "Walks the date-ranged daily-stats series backwards into a local SQLite archive and resumes where it stopped — 28-day windows where Garmin caps a request at 28 days, 364-day windows where it does not, and one request per day for the per-day series.",
-      "rationale": "Garmin caps every daily-stats request at 28 days, so years of history exist only if something walks and stores them.",
-      "example": "garmin-pp-cli history --backfill",
+      "description": "Fills a local SQLite archive from the oldest day forward, one bookmark per series, so an interrupted run continues where it stopped — 28-day windows where Garmin caps a request at 28 days, 364-day windows where it does not, and one request per day for the per-day series, asked only for days something was recorded.",
+      "rationale": "Garmin caps every daily-stats request at 28 days, so years of history exist only if something walks and stores them — and a fill that costs hours has to say so before it starts.",
+      "example": "garmin-pp-cli history --since all --dry-run",
       "why_it_matters": "Run this before any trend question; every analytics command reads the archive, not the API.",
       "group": "Local state that compounds"
     }
@@ -108,7 +108,7 @@
   "narrative": {
     "display_name": "Garmin Connect",
     "headline": "Your whole Garmin history in a local database, not one 28-day page at a time.",
-    "value_prop": "Garmin Connect caps every daily-stats request at 28 days and offers no personal API token, which is why the ecosystem is a handful of Python libraries rather than a tool you can call. This CLI signs in through your own browser, keeps each account's tokens in its own home, walks the whole history into SQLite, and answers sleep, training, heart-rate and activity questions from the archive with JSON on stdout.",
+    "value_prop": "Garmin Connect caps every daily-stats request at 28 days and offers no personal API token, which is why the ecosystem is a handful of Python libraries rather than a tool you can call. This CLI signs in through your own browser, keeps each account's tokens in its own home, fills the whole history into SQLite oldest day first — interrupt it and the next run continues where it stopped — and answers sleep, training, heart-rate and activity questions from the archive with JSON on stdout.",
     "auth_narrative": "Garmin issues no personal API key. Sign-in goes through Garmin's own page in your browser: `auth login` opens it, catches the redirect back to a loopback port on 127.0.0.1, exchanges the ticket for an access token and a refresh token, and checks the account email on the resulting token against the one you named before writing anything to disk. The password never reaches this CLI, and the refresh token keeps the session alive without another browser visit. A token supplied through GARMIN_ACCESS_TOKEN or GARMIN_TOKEN is used as-is instead: it is never refreshed, it is not this home's stored chain, and plain `auth status` reports it as not this home's asserted account (run `auth status --verify` to have Garmin confirm which account that token belongs to). One Garmin account per home. To connect a second household account, in this order: sign out of Garmin in the browser; run the login under that account's own home with `GARMIN_HOME=~/.local/share/garmin-homes/other garmin-pp-cli auth login --email other@example.com`; confirm the account email the login prints is the one you meant; sign out of Garmin in the browser again. Clearing browser cookies is never required, and this CLI never attempts it — those sign-outs are ordinary sign-outs on Garmin's own site, so the choreography works for a user with no file-system access to the browser profile. Check which account a home holds with `garmin-pp-cli auth status` (add `--verify` to confirm it with one call to Garmin), and clear a home's stored chain with `garmin-pp-cli auth logout`.",
     "quickstart": [
       {
@@ -120,12 +120,12 @@
         "comment": "Confirms the token works and prints the displayName the rest of the commands need."
       },
       {
-        "command": "garmin-pp-cli history --backfill",
-        "comment": "Walks the date-ranged daily-stats series backwards into the local archive; the first run backfills, later runs resume."
+        "command": "garmin-pp-cli history --since all",
+        "comment": "Fills the local archive: every series oldest day first, with one bookmark each. It prints what the expensive part will cost before it starts, and interrupting it is safe."
       },
       {
-        "command": "garmin-pp-cli history --series activity_detail,activity_splits,hr_zone_config",
-        "comment": "Fills the per-activity detail, splits and heart-rate-zone configuration that `sync` used to fetch; `sync` itself is superseded and only points back here."
+        "command": "garmin-pp-cli history --status",
+        "comment": "What each series already holds, how far it is filled, and how many requests it still owes. Makes no request."
       },
       {
         "command": "garmin-pp-cli sleep stats --start 2026-08-01 --end 2026-08-28",
@@ -152,6 +152,10 @@
       {
         "symptom": "Commands read the wrong person's data on a shared machine.",
         "fix": "Set GARMIN_HOME (or pass --home) per account; `doctor --json` prints which home directory each kind resolved to and why."
+      },
+      {
+        "symptom": "A `history` run was interrupted, or stopped partway with a warning.",
+        "fix": "Run it again. Each series keeps one bookmark, so the next run continues from where it stopped instead of starting over; `history --status` shows how far each one got."
       }
     ],
     "when_to_use": "Reach for this CLI for any question about the owner's Garmin Connect history: sleep trends, training status and readiness, VO2 max, resting heart rate, step and intensity-minute trends, heart-rate zones, and the activity feed. It is at its best on questions that span months or years, because those are answered from the local archive rather than from Garmin's 28-day pages. Run `history` to fill the archive, then query it. `history` is the only command that fills the archive: `sync` is superseded and prints a pointer to `history`.",
@@ -162,6 +166,11 @@
       "Do not use it for Strava, Apple Health, Whoop or Oura data."
     ],
     "recipes": [
+      {
+        "title": "First fill, and what to do if it stops",
+        "command": "garmin-pp-cli history --since all",
+        "explanation": "Fills every series from the oldest day it can reach. Before the expensive per-activity and per-day fetches it prints what they will cost in requests, time and disk — `--dry-run` prints the same thing without fetching anything. Interrupting is safe: run it again and it continues where it stopped. For a shallower fill, `--since 2026-01-01` starts there instead, and a later deeper `--since` extends the archive downward without re-fetching what is already stored."
+      },
       {
         "title": "Four weeks of sleep score in one call",
         "command": "garmin-pp-cli sleep score-stats --start 2026-08-10 --end 2026-09-06",

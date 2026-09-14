@@ -47,11 +47,10 @@ func newGarminSyncStubCmd(flags *rootFlags) *cobra.Command {
 		Long: `Superseded. Run ` + "`garmin-pp-cli history`" + ` instead.
 
 This CLI keeps one local archive and ` + "`history`" + ` is the only command that
-fills it: the calendar walk, the per-series resume state and the empty-window
-stop rule all live there, along with the per-activity detail, splits and
-heart-rate-zone fetches this verb used to make. Running both stored the same
-data twice under different names, so this verb now prints where to go and
-exits 2.
+fills it: the calendar walk and its per-series filled-range state both live
+there, along with the per-activity detail, splits and heart-rate-zone fetches
+this verb used to make. Running both stored the same data twice under
+different names, so this verb now prints where to go and exits 2.
 
 Generated messages elsewhere that say "run ` + "`garmin-pp-cli sync`" + ` first"
 still lead to the right place: they lead here, and here says ` + "`history`" + `.`,

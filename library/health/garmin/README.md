@@ -2,7 +2,7 @@
 
 **Your whole Garmin history in a local database, not one 28-day page at a time.**
 
-Garmin Connect caps every daily-stats request at 28 days and offers no personal API token, which is why the ecosystem is a handful of Python libraries rather than a tool you can call. This CLI signs in through your own browser, keeps each account's tokens in its own home, walks the whole history into SQLite, and answers sleep, training, heart-rate and activity questions from the archive with JSON on stdout.
+Garmin Connect caps every daily-stats request at 28 days and offers no personal API token, which is why the ecosystem is a handful of Python libraries rather than a tool you can call. This CLI signs in through your own browser, keeps each account's tokens in its own home, fills the whole history into SQLite oldest day first — interrupt it and the next run continues where it stopped — and answers sleep, training, heart-rate and activity questions from the archive with JSON on stdout.
 
 Created by [@prashantkamani](https://github.com/prashantkamani) (Aria Kamani).
 
@@ -130,11 +130,11 @@ garmin-pp-cli auth login --email you@example.com
 # Confirms the token works and prints the displayName the rest of the commands need.
 garmin-pp-cli account social-profile
 
-# Walks the date-ranged daily-stats series backwards into the local archive; the first run backfills, later runs resume.
-garmin-pp-cli history --backfill
+# Fills the local archive: every series oldest day first, with one bookmark each. It prints what the expensive part will cost before it starts, and interrupting it is safe.
+garmin-pp-cli history --since all
 
-# Fills the per-activity detail, splits and heart-rate-zone configuration that `sync` used to fetch; `sync` itself is superseded and only points back here.
-garmin-pp-cli history --series activity_detail,activity_splits,hr_zone_config
+# What each series already holds, how far it is filled, and how many requests it still owes. Makes no request.
+garmin-pp-cli history --status
 
 # A month of nightly sleep summaries straight from Garmin.
 garmin-pp-cli sleep stats --start 2026-08-01 --end 2026-08-28
@@ -155,15 +155,23 @@ These capabilities aren't available in any other tool for this API.
   ```
 
 ### Local state that compounds
-- **`history`** — Walks the date-ranged daily-stats series backwards into a local SQLite archive and resumes where it stopped — 28-day windows where Garmin caps a request at 28 days, 364-day windows where it does not, and one request per day for the per-day series.
+- **`history`** — Fills a local SQLite archive from the oldest day forward, one bookmark per series, so an interrupted run continues where it stopped — 28-day windows where Garmin caps a request at 28 days, 364-day windows where it does not, and one request per day for the per-day series, asked only for days something was recorded.
 
   _Run this before any trend question; every analytics command reads the archive, not the API._
 
   ```bash
-  garmin-pp-cli history --backfill
+  garmin-pp-cli history --since all --dry-run
   ```
 
 ## Recipes
+
+### First fill, and what to do if it stops
+
+```bash
+garmin-pp-cli history --since all
+```
+
+Fills every series from the oldest day it can reach. Before the expensive per-activity and per-day fetches it prints what they will cost in requests, time and disk — `--dry-run` prints the same thing without fetching anything. Interrupting is safe: run it again and it continues where it stopped. For a shallower fill, `--since 2026-01-01` starts there instead, and a later deeper `--since` extends the archive downward without re-fetching what is already stored.
 
 ### Four weeks of sleep score in one call
 
@@ -244,18 +252,26 @@ Existing installs keep working because the platform-default rung matches the leg
 
 ## Why `sync` is a dead-end
 
-`garmin-pp-cli` keeps one local archive and `history` is the only command that fills it. The generated `sync` exists because CLI Printing Press emits it with every SQLite store, and for Garmin it can only do three things: page a flat list, add a `since=` filter that the list endpoint declares, and walk rows of a parent table into a child URL. Garmin's daily statistics sit behind date-range endpoints whose URL carries the range and which refuse more than 28 days per call, or behind per-day endpoints that answer for one date. Neither fits those shapes, so the calendar walk, its per-series resume state and the empty-window stop rule live in `history`. Running one account through both verbs stored the activity feed and the per-activity heart-rate zones twice under different names, and re-paged the whole activity feed on every `sync`, because Garmin's activity list declares no filter the generator recognises. `history` therefore also carries the three fetches only `sync` used to make (activity detail, splits, heart-rate-zone configuration), and `sync` prints a pointer to `history` and exits. Generated messages that say "run `garmin-pp-cli sync` first" still lead to the right place.
+`garmin-pp-cli` keeps one local archive and `history` is the only command that fills it. The generated `sync` exists because CLI Printing Press emits it with every SQLite store, and for Garmin it can only do three things: page a flat list, add a `since=` filter that the list endpoint declares, and walk rows of a parent table into a child URL. Garmin's daily statistics sit behind date-range endpoints whose URL carries the range and which refuse more than 28 days per call, or behind per-day endpoints that answer for one date. Neither fits those shapes, so the calendar walk and its per-series filled-range state live in `history`. Running one account through both verbs stored the activity feed and the per-activity heart-rate zones twice under different names, and re-paged the whole activity feed on every `sync`, because Garmin's activity list declares no filter the generator recognises. `history` therefore also carries the three fetches only `sync` used to make (activity detail, splits, heart-rate-zone configuration), and `sync` prints a pointer to `history` and exits. Generated messages that say "run `garmin-pp-cli sync` first" still lead to the right place.
 
 ## Commands
 
-The novel `history` verb walks the date-ranged daily-stats series backwards into the local archive
-and resumes where it stopped — 28-day windows where Garmin caps a request at 28 days (sleep stats,
-sleep score, steps), 364-day windows where it does not (resting HR, VO2 max, intensity minutes), and
-one request per day for the per-day series (daily summary, sleep detail, daily HR, training
-readiness), bounded by `--days`. It also pages the activity feed and fans out over it for the
-per-activity fetches (detail, splits, HR zones), and keeps the account's heart-rate-zone
-configuration. `history` is the only command that fills the archive; the generated `sync` verb is
-superseded and prints a pointer to `history`.
+The novel `history` verb fills the local archive from the oldest day forward and keeps one bookmark
+per series, so an interrupted run continues where it stopped — 28-day windows where Garmin caps a
+request at 28 days (sleep stats, sleep score, steps), 364-day windows where it does not (resting HR,
+VO2 max, intensity minutes), and one request per day for the per-day series (daily summary, sleep
+detail, daily HR, training readiness), asked only for the days a cheaper series already shows a
+reading for. It also pages the activity feed and fans out over it for the per-activity fetches
+(detail, splits, HR zones), and keeps the account's heart-rate-zone configuration.
+
+How far back to go is the only choice it offers: `--since all` for everything the account holds,
+`--since YYYY-MM-DD` to start there, and neither to keep the depth the archive already has and catch
+up to today. A later, deeper `--since` extends the archive downward without re-fetching the range
+already filled. Before the per-activity and per-day fetches — the expensive half of a run — it
+prints what they will cost in requests, time and disk; `--dry-run` prints the same thing without
+fetching anything, and `--status` reports what each series already holds and still owes. `history`
+is the only command that fills the archive; the generated `sync` verb is superseded and prints a
+pointer to `history`.
 
 ### account
 
@@ -335,15 +351,16 @@ the fallback if the account-scoped path ever changes.
 than fetching per-night detail when the question is about a trend rather than one night. At most
 28 calendar days per request.
 - **`garmin-pp-cli sleep stats`** - One row per night between `start` and `end`, aggregated by Garmin. At most 28 calendar days per
-request; `history` walks longer ranges backwards in 28-day windows into the local archive and
-de-duplicates on the calendar date. Rows arrive under `individualStats`.
+request; `history` fills longer ranges into the local archive in 28-day windows, oldest day
+first, de-duplicating on the calendar date. Rows arrive under `individualStats`.
 
 ### steps
 
 Daily and weekly step totals against the account's goal.
 
 - **`garmin-pp-cli steps daily`** - One row per calendar date with total steps, the step goal and the distance walked. At most 28
-calendar days per request; `history` walks longer ranges in 28-day windows into the local archive.
+calendar days per request; `history` fills longer ranges into the local archive in 28-day
+windows, oldest day first.
 - **`garmin-pp-cli steps weekly`** - Weekly step buckets instead of daily ones, which covers about a year in a single request where
 the daily form would take thirteen. Use it for long-horizon trend questions and fall back to the
 daily form when a specific date matters.
@@ -468,6 +485,7 @@ If you use agentcookie to sync secrets across machines, this CLI auto-adopts age
 - **A range longer than 28 days returns fewer rows than expected.** — Garmin caps daily-stats requests at 28 calendar days. Use `history` and query the local archive instead of asking one endpoint for a long range; `history` is the only command that walks this series.
 - **`sync` prints "sync is superseded by history" and exits 2.** — `history` is the only command that fills the archive; `sync` is a dead end and prints a pointer to it. See "Why `sync` is a dead-end" in the README for the full reason.
 - **Commands read the wrong person's data on a shared machine.** — Set GARMIN_HOME (or pass --home) per account; `doctor --json` prints which home directory each kind resolved to and why.
+- **A `history` run was interrupted, or stopped partway with a warning.** — Run it again. Each series keeps one bookmark, so the next run continues from where it stopped instead of starting over; `history --status` shows how far each one got.
 
 ## Sources & Inspiration
 

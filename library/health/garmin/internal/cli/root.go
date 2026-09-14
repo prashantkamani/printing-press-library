@@ -301,7 +301,7 @@ func newRootCmd(flags *rootFlags) *cobra.Command {
 
 Highlights (not in the official API docs):
   • auth login   Signs in through Garmin's own page in your browser, catches the redirect on a loopback port, and refuses to store a token whose account email does not match the one you named.
-  • history   Walks the date-ranged daily-stats series backwards into a local SQLite archive and resumes where it stopped — 28-day windows where Garmin caps a request at 28 days, 364-day windows where it does not,…
+  • history   Fills a local SQLite archive from the oldest day forward, one bookmark per series, so an interrupted run continues where it stopped — 28-day windows where Garmin caps a request at 28 days, 364-day wi…
 
 Agent mode: add --agent to any command for JSON output + non-interactive mode.
 Health check: run 'garmin-pp-cli doctor' to verify auth and connectivity.

@@ -132,49 +132,6 @@ func TestCompleteDayCeiling_ExcludesToday(t *testing.T) {
 	}
 }
 
-func TestPlanBackwardWindow_StepsBackAndStopsAtTheFloor(t *testing.T) {
-	frontier := mustParseCivilDay("2026-01-01")
-	floor := mustParseCivilDay("2025-12-01")
-
-	w, ok := planBackwardWindow(frontier, floor, 28)
-	if !ok {
-		t.Fatal("first backward window was not planned")
-	}
-	if got := w.String(); got != "2025-12-04..2025-12-31" {
-		t.Fatalf("first backward window = %s", got)
-	}
-
-	// The next step is clamped by the floor rather than reaching past it.
-	w2, ok := planBackwardWindow(w.start, floor, 28)
-	if !ok {
-		t.Fatal("second backward window was not planned")
-	}
-	if got := w2.String(); got != "2025-12-01..2025-12-03" {
-		t.Fatalf("floor-clamped window = %s, want 2025-12-01..2025-12-03", got)
-	}
-
-	// Once the floor is reached the walk terminates with no further window.
-	if _, ok := planBackwardWindow(w2.start, floor, 28); ok {
-		t.Fatal("a walk that reached its floor planned another window; it must terminate")
-	}
-}
-
-func TestEnumerateDaysNewestFirst(t *testing.T) {
-	days := enumerateDaysNewestFirst(mustParseCivilDay("2026-09-05"), mustParseCivilDay("2026-09-08"))
-	want := []string{"2026-09-08", "2026-09-07", "2026-09-06", "2026-09-05"}
-	if len(days) != len(want) {
-		t.Fatalf("got %d days, want %d", len(days), len(want))
-	}
-	for i, d := range days {
-		if d.String() != want[i] {
-			t.Fatalf("day %d = %s, want %s", i, d, want[i])
-		}
-	}
-	if got := enumerateDaysNewestFirst(mustParseCivilDay("2026-09-08"), mustParseCivilDay("2026-09-05")); got != nil {
-		t.Fatalf("an inverted range enumerated %v, want nothing", got)
-	}
-}
-
 func TestParseCivilDay_RejectsNonDates(t *testing.T) {
 	for _, bad := range []string{"", "2026-13-01", "not-a-date", "2026/09/08", "20260908"} {
 		if _, err := parseCivilDay(bad); err == nil {

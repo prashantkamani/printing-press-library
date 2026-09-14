@@ -12,6 +12,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -94,23 +95,67 @@ func newTestWalker(t *testing.T, db *store.Store, api *fakeGarmin, opts garminWa
 	if opts.loc == nil {
 		opts.loc = time.UTC
 	}
-	if opts.days == 0 {
-		opts.days = 28
-	}
-	if opts.emptyWindowCeiling == 0 {
-		opts.emptyWindowCeiling = 13
-	}
 	if opts.activityPageSize == 0 {
 		opts.activityPageSize = 100
 	}
 	rec := &sleepRecorder{}
 	return &garminWalker{
-		client: api,
-		db:     db,
-		emit:   &garminEmitter{w: io.Discard, machine: true},
-		opts:   opts,
-		pacer:  newGarminPacer(opts.delay, rec.sleep),
+		client:  api,
+		db:      db,
+		emit:    &garminEmitter{w: io.Discard, machine: true},
+		opts:    opts,
+		planner: newTestPlanner(db, opts),
+		pacer:   newGarminPacer(opts.delay, rec.sleep),
 	}, rec
+}
+
+func newTestPlanner(db *store.Store, opts garminWalkOptions) *garminPlanner {
+	return &garminPlanner{
+		db: db, depth: opts.depth, now: opts.now, loc: opts.loc,
+		delay: opts.delay, maxDependents: opts.maxDependents,
+	}
+}
+
+// sinceDay and sinceAll are the two --since values a test can ask for; the
+// zero garminDepth is a plain `history`, which keeps each series' stored depth.
+func sinceDay(day string) garminDepth {
+	return garminDepth{mode: depthFrom, day: mustParseCivilDay(day)}
+}
+
+func sinceAll() garminDepth { return garminDepth{mode: depthAll} }
+
+// seedSignalDays writes one steps row per day so the per-day series have a
+// signal to walk: a per-day series only asks for days something was recorded.
+func seedSignalDays(t *testing.T, db *store.Store, days ...string) {
+	t.Helper()
+	for _, d := range days {
+		if err := db.Upsert("steps", d, json.RawMessage(`{"calendarDate":"`+d+`","totalSteps":1000}`)); err != nil {
+			t.Fatalf("seed signal day %s: %v", d, err)
+		}
+	}
+}
+
+// requestedDays pulls the calendar day out of every call a per-day series
+// made, in the order the calls went out.
+func requestedDays(api *fakeGarmin, param string) []string {
+	var out []string
+	for _, c := range api.calls {
+		if v, ok := c.params[param]; ok {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// assertAscending fails unless every entry is strictly newer than the one
+// before it. Oldest-first is the property every series' walk now claims.
+func assertAscending(t *testing.T, what string, days []string) {
+	t.Helper()
+	for i := 1; i < len(days); i++ {
+		if days[i] <= days[i-1] {
+			t.Fatalf("%s went out of order: %s followed %s (full order: %v)", what, days[i], days[i-1], days)
+		}
+	}
 }
 
 func seriesNamed(t *testing.T, name string) garminSeries {
@@ -144,7 +189,7 @@ func TestWalkWindowed_StoresEveryDayAndNeverBookmarksToday(t *testing.T) {
 	api := &fakeGarmin{respond: func(c fakeCall, _ int) (json.RawMessage, error) {
 		return stepsWindowPayload(c.path), nil
 	}}
-	w, _ := newTestWalker(t, db, api, garminWalkOptions{days: 56, now: fixedClock("2026-09-08")})
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{depth: sinceDay("2026-07-15"), now: fixedClock("2026-09-08")})
 
 	out := w.walkSeries(context.Background(), seriesNamed(t, "steps"))
 	if out.errored {
@@ -190,12 +235,12 @@ func TestWalkWindowed_SecondRunResumesFromTheBookmark(t *testing.T) {
 	api := &fakeGarmin{respond: func(c fakeCall, _ int) (json.RawMessage, error) {
 		return stepsWindowPayload(c.path), nil
 	}}
-	first, _ := newTestWalker(t, db, api, garminWalkOptions{days: 56, now: fixedClock("2026-09-08")})
+	first, _ := newTestWalker(t, db, api, garminWalkOptions{depth: sinceDay("2026-07-15"), now: fixedClock("2026-09-08")})
 	first.walkSeries(context.Background(), seriesNamed(t, "steps"))
 	callsAfterFirst := len(api.calls)
 
 	// Three days later the archive only owes those three days plus today.
-	second, _ := newTestWalker(t, db, api, garminWalkOptions{days: 56, now: fixedClock("2026-09-11")})
+	second, _ := newTestWalker(t, db, api, garminWalkOptions{depth: sinceDay("2026-07-15"), now: fixedClock("2026-09-11")})
 	out := second.walkSeries(context.Background(), seriesNamed(t, "steps"))
 	if out.errored {
 		t.Fatalf("second walk errored: %v", out.err)
@@ -227,7 +272,7 @@ func TestWalkWindowed_CheckpointsEachWindowSoAFailureResumes(t *testing.T) {
 		return stepsWindowPayload(c.path), nil
 	}}
 	// 84 days = three 28-day windows; the third fails.
-	w, _ := newTestWalker(t, db, api, garminWalkOptions{days: 84, now: fixedClock("2026-09-08")})
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{depth: sinceDay("2026-06-17"), now: fixedClock("2026-09-08")})
 	out := w.walkSeries(context.Background(), seriesNamed(t, "steps"))
 	if out.errored {
 		t.Fatalf("a transport failure on one window must warn, not fail the series: %v", out.err)
@@ -246,7 +291,7 @@ func TestWalkWindowed_CheckpointsEachWindowSoAFailureResumes(t *testing.T) {
 	// Resume: the API recovers, and only the missing tail is re-requested.
 	callsBefore := len(api.calls)
 	api.respond = func(c fakeCall, _ int) (json.RawMessage, error) { return stepsWindowPayload(c.path), nil }
-	resume, _ := newTestWalker(t, db, api, garminWalkOptions{days: 84, now: fixedClock("2026-09-08")})
+	resume, _ := newTestWalker(t, db, api, garminWalkOptions{depth: sinceDay("2026-06-17"), now: fixedClock("2026-09-08")})
 	out2 := resume.walkSeries(context.Background(), seriesNamed(t, "steps"))
 	if out2.errored || out2.warned {
 		t.Fatalf("resume did not run clean: warned=%v err=%v", out2.warned, out2.err)
@@ -260,121 +305,152 @@ func TestWalkWindowed_CheckpointsEachWindowSoAFailureResumes(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Backfill and the empty-window ceiling
+// Depth: the extension leg, the forward leg, and one bookmark
 // ---------------------------------------------------------------------------
 
-func TestWalkWindowed_BackfillStopsAtTheEmptyWindowCeiling(t *testing.T) {
-	db := testStore(t)
-	// History exists back to 2026-06-01 and nothing before it.
-	historyStart := mustParseCivilDay("2026-06-01")
-	api := &fakeGarmin{respond: func(c fakeCall, _ int) (json.RawMessage, error) {
-		full := stepsWindowPayload(c.path)
-		var rows []json.RawMessage
-		_ = json.Unmarshal(full, &rows)
-		kept := make([]json.RawMessage, 0, len(rows))
-		for _, r := range rows {
-			day, _ := dayFromValue(jsonStringField(r, "calendarDate"))
-			if !day.before(historyStart) {
-				kept = append(kept, r)
-			}
+// windowStarts pulls the start day out of every windowed request made against
+// one path prefix, in the order the calls went out.
+func windowStarts(api *fakeGarmin, prefix string) []string {
+	var out []string
+	for _, c := range api.calls {
+		if !strings.HasPrefix(c.path, prefix) {
+			continue
 		}
-		out, _ := json.Marshal(kept)
-		return out, nil
-	}}
-	w, _ := newTestWalker(t, db, api, garminWalkOptions{
-		days: 28, backfill: true, emptyWindowCeiling: 3, now: fixedClock("2026-09-08"),
-	})
-	out := w.walkSeries(context.Background(), seriesNamed(t, "steps"))
-	if out.errored {
-		t.Fatalf("backfill errored: %v", out.err)
+		out = append(out, strings.Split(strings.TrimPrefix(c.path, prefix), "/")[0])
 	}
-	st, _ := db.GetGarminSeriesState("steps")
-	if st.StopReason != "empty_window_ceiling" {
-		t.Fatalf("stop_reason = %q, want empty_window_ceiling", st.StopReason)
-	}
-	if st.EmptyWindows != 3 {
-		t.Fatalf("empty_windows = %d, want exactly the ceiling of 3", st.EmptyWindows)
-	}
-	if st.EarliestDay != "2026-06-01" {
-		t.Fatalf("earliest_day = %q, want 2026-06-01 (the oldest day that actually carried data)", st.EarliestDay)
-	}
-	// The frontier records how deep the walk probed, which is three empty
-	// windows past the oldest data.
-	frontier := mustParseCivilDay(st.FrontierDay)
-	if !frontier.before(mustParseCivilDay("2026-06-01")) {
-		t.Fatalf("frontier_day = %q; it must sit below earliest_day so a deeper re-run does not re-probe", st.FrontierDay)
-	}
-
-	// A re-run with the same ceiling must not walk further: the walk is
-	// already at its stop.
-	callsBefore := len(api.calls)
-	again, _ := newTestWalker(t, db, api, garminWalkOptions{
-		days: 28, backfill: true, emptyWindowCeiling: 3, now: fixedClock("2026-09-08"),
-	})
-	again.walkSeries(context.Background(), seriesNamed(t, "steps"))
-	backwardCalls := 0
-	for _, c := range api.calls[callsBefore:] {
-		start := strings.Split(strings.TrimPrefix(c.path, "/usersummary-service/stats/steps/daily/"), "/")[0]
-		if mustParseCivilDay(start).before(mustParseCivilDay("2026-08-12")) {
-			backwardCalls++
-		}
-	}
-	if backwardCalls != 0 {
-		t.Fatalf("a re-run at the same ceiling walked %d more windows backwards; the ceiling must hold", backwardCalls)
-	}
+	return out
 }
 
-// An empty window from a series that has never returned a single row cannot
-// distinguish "this account has no data" from "this tool is asking wrong", so
-// the walk must refuse to stamp an earliest_day off the back of it.
-func TestWalkWindowed_NeverReturnedDataDoesNotStampEarliestDay(t *testing.T) {
+const maxMetricsPrefix = "/metrics-service/metrics/maxmet/daily/"
+const stepsPrefix = "/usersummary-service/stats/steps/daily/"
+
+// A full fill starts at Garmin's own history floor and walks upward. Not at
+// the first activity: a watch-only account has none, and wellness can predate
+// the first activity on an account that has one.
+func TestWalkWindowed_FullFillStartsAtTheHistoryFloorAndWalksOldestFirst(t *testing.T) {
 	db := testStore(t)
 	api := &fakeGarmin{respond: func(fakeCall, int) (json.RawMessage, error) {
 		return json.RawMessage(`[]`), nil
 	}}
-	w, _ := newTestWalker(t, db, api, garminWalkOptions{
-		days: 28, backfill: true, emptyWindowCeiling: 2, now: fixedClock("2026-09-08"),
-	})
-	out := w.walkSeries(context.Background(), seriesNamed(t, "steps"))
-	if !out.warned {
-		t.Fatal("a series that never returned a row must warn")
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{depth: sinceAll(), now: fixedClock("2026-09-08")})
+	out := w.walkWindowed(context.Background(), seriesNamed(t, "max_metrics"))
+	if out.errored {
+		t.Fatalf("full fill errored: %v", out.err)
 	}
-	st, _ := db.GetGarminSeriesState("steps")
-	if st.StopReason != "never_returned_data" {
-		t.Fatalf("stop_reason = %q, want never_returned_data", st.StopReason)
+	starts := windowStarts(api, maxMetricsPrefix)
+	if len(starts) == 0 {
+		t.Fatal("the fill made no windowed requests")
 	}
-	if st.EarliestDay != "" {
-		t.Fatalf("earliest_day = %q, want it left unset: an all-empty walk proves nothing about where history begins", st.EarliestDay)
+	if starts[0] != "2007-01-01" {
+		t.Fatalf("the first window started at %s, want the 2007-01-01 history floor", starts[0])
+	}
+	assertAscending(t, "max_metrics windows", starts)
+	st, _ := db.GetGarminSeriesState("max_metrics")
+	if st.EarliestDay != "2007-01-01" {
+		t.Fatalf("earliest_day = %q, want the floor 2007-01-01: the series is filled from there whether or not a row came back", st.EarliestDay)
+	}
+	if st.LastCompleteDay != "2026-09-07" {
+		t.Fatalf("last_complete_day = %q, want 2026-09-07", st.LastCompleteDay)
+	}
+	if st.WalkVersion != store.GarminWalkVersion {
+		t.Fatalf("walk_version = %d, want %d", st.WalkVersion, store.GarminWalkVersion)
 	}
 }
 
-func TestWalkWindowed_BackfillStopsAtTheHistoryFloor(t *testing.T) {
+// A deeper --since extends the archive downward and leaves the range already
+// filled alone. Re-walking it would cost the whole depth again on every run
+// that asked for one more month.
+func TestWalkWindowed_ADeeperSinceExtendsDownwardOnly(t *testing.T) {
 	db := testStore(t)
-	// Every window carries data, so only the floor can stop the walk.
 	api := &fakeGarmin{respond: func(c fakeCall, _ int) (json.RawMessage, error) {
 		return stepsWindowPayload(c.path), nil
 	}}
-	s := seriesNamed(t, "steps")
-	s.floor = mustParseCivilDay("2026-01-01")
-	w, _ := newTestWalker(t, db, api, garminWalkOptions{
-		days: 28, backfill: true, emptyWindowCeiling: 13, now: fixedClock("2026-09-08"),
-	})
-	out := w.walkWindowed(context.Background(), s)
-	if out.errored {
-		t.Fatalf("floor walk errored: %v", out.err)
+	steps := seriesNamed(t, "steps")
+	first, _ := newTestWalker(t, db, api, garminWalkOptions{depth: sinceDay("2026-08-01"), now: fixedClock("2026-09-08")})
+	first.walkWindowed(context.Background(), steps)
+	st, _ := db.GetGarminSeriesState("steps")
+	if st.EarliestDay != "2026-08-01" || st.LastCompleteDay != "2026-09-07" {
+		t.Fatalf("after the first run state = (%s..%s), want 2026-08-01..2026-09-07", st.EarliestDay, st.LastCompleteDay)
+	}
+	before := len(api.calls)
+
+	second, _ := newTestWalker(t, db, api, garminWalkOptions{depth: sinceDay("2026-06-01"), now: fixedClock("2026-09-08")})
+	second.walkWindowed(context.Background(), steps)
+	filledStart := mustParseCivilDay("2026-08-01")
+	filledEnd := mustParseCivilDay("2026-09-07")
+	extension := 0
+	for _, c := range api.calls[before:] {
+		parts := strings.Split(strings.TrimPrefix(c.path, stepsPrefix), "/")
+		start, end := mustParseCivilDay(parts[0]), mustParseCivilDay(parts[1])
+		switch {
+		case end.before(filledStart):
+			extension++
+		case start.after(filledEnd):
+			// The forward leg: today, which is never complete.
+		default:
+			t.Fatalf("the deeper run re-requested %s..%s, which is inside the range already filled", parts[0], parts[1])
+		}
+	}
+	if extension != 3 {
+		t.Fatalf("the extension leg made %d windows, want 3 (2026-06-01..2026-07-31 at 28 days)", extension)
+	}
+	assertAscending(t, "extension windows", windowStarts(api, stepsPrefix)[before:before+extension])
+	st, _ = db.GetGarminSeriesState("steps")
+	if st.EarliestDay != "2026-06-01" {
+		t.Fatalf("earliest_day = %q after the deeper run, want 2026-06-01", st.EarliestDay)
+	}
+}
+
+// A plain `history` never changes depth: it catches up to today and stops.
+func TestWalkWindowed_APlainRunKeepsTheStoredDepth(t *testing.T) {
+	db := testStore(t)
+	api := &fakeGarmin{respond: func(c fakeCall, _ int) (json.RawMessage, error) {
+		return stepsWindowPayload(c.path), nil
+	}}
+	steps := seriesNamed(t, "steps")
+	first, _ := newTestWalker(t, db, api, garminWalkOptions{depth: sinceDay("2026-08-01"), now: fixedClock("2026-09-08")})
+	first.walkWindowed(context.Background(), steps)
+	before := len(api.calls)
+
+	plain, _ := newTestWalker(t, db, api, garminWalkOptions{now: fixedClock("2026-09-11")})
+	plain.walkWindowed(context.Background(), steps)
+	if got := len(api.calls) - before; got != 1 {
+		t.Fatalf("a plain run made %d calls, want 1: it catches up and never deepens", got)
+	}
+	if got := api.calls[len(api.calls)-1].path; !strings.HasSuffix(got, "/2026-09-08/2026-09-11") {
+		t.Fatalf("the catch-up window was %s, want 2026-09-08..2026-09-11", got)
 	}
 	st, _ := db.GetGarminSeriesState("steps")
-	if st.StopReason != "floor" {
-		t.Fatalf("stop_reason = %q, want floor", st.StopReason)
+	if st.EarliestDay != "2026-08-01" {
+		t.Fatalf("earliest_day = %q; a plain run must not change the depth", st.EarliestDay)
 	}
-	if st.EarliestDay != "2026-01-01" {
-		t.Fatalf("earliest_day = %q, want the floor 2026-01-01", st.EarliestDay)
+}
+
+// A --since above what the archive already holds asks for nothing below it and
+// takes nothing away either.
+func TestWalkWindowed_AShallowerSinceDoesNotShrinkTheArchive(t *testing.T) {
+	db := testStore(t)
+	api := &fakeGarmin{respond: func(c fakeCall, _ int) (json.RawMessage, error) {
+		return stepsWindowPayload(c.path), nil
+	}}
+	steps := seriesNamed(t, "steps")
+	first, _ := newTestWalker(t, db, api, garminWalkOptions{depth: sinceDay("2026-06-01"), now: fixedClock("2026-09-08")})
+	first.walkWindowed(context.Background(), steps)
+	before := len(api.calls)
+
+	var notes bytes.Buffer
+	shallow, _ := newTestWalker(t, db, api, garminWalkOptions{depth: sinceDay("2026-08-15"), now: fixedClock("2026-09-08")})
+	shallow.emit = &garminEmitter{w: io.Discard, noteW: &notes}
+	shallow.walkWindowed(context.Background(), steps)
+	if got := len(api.calls) - before; got != 1 {
+		t.Fatalf("the shallower run made %d calls, want 1 (today only)", got)
 	}
-	for _, c := range api.calls {
-		start := strings.Split(strings.TrimPrefix(c.path, "/usersummary-service/stats/steps/daily/"), "/")[0]
-		if mustParseCivilDay(start).before(s.floor) {
-			t.Fatalf("a window started at %s, below the floor %s", start, s.floor)
-		}
+	st, _ := db.GetGarminSeriesState("steps")
+	if st.EarliestDay != "2026-06-01" {
+		t.Fatalf("earliest_day = %q; a shallower --since must not shrink the filled range", st.EarliestDay)
+	}
+	if !strings.Contains(notes.String(), "2026-06-01") {
+		t.Fatalf("the run said nothing about already reaching deeper than --since: %q", notes.String())
 	}
 }
 
@@ -390,7 +466,7 @@ func TestWalk_FailsFastOnRateLimitWithoutRetrying(t *testing.T) {
 		}
 		return nil, fmt.Errorf("GET %s returned HTTP 429", c.path)
 	}}
-	w, _ := newTestWalker(t, db, api, garminWalkOptions{days: 200, backfill: true, now: fixedClock("2026-09-08")})
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{depth: sinceDay("2026-02-21"), now: fixedClock("2026-09-08")})
 	out := w.walkSeries(context.Background(), seriesNamed(t, "steps"))
 
 	if !out.errored {
@@ -437,7 +513,7 @@ func TestPacer_SpacesEveryCallButTheFirst(t *testing.T) {
 	api := &fakeGarmin{respond: func(c fakeCall, _ int) (json.RawMessage, error) {
 		return stepsWindowPayload(c.path), nil
 	}}
-	w, rec := newTestWalker(t, db, api, garminWalkOptions{days: 84, delay: 300 * time.Millisecond, now: fixedClock("2026-09-08")})
+	w, rec := newTestWalker(t, db, api, garminWalkOptions{depth: sinceDay("2026-06-17"), delay: 300 * time.Millisecond, now: fixedClock("2026-09-08")})
 	w.walkSeries(context.Background(), seriesNamed(t, "steps"))
 
 	if len(api.calls) != 3 {
@@ -452,44 +528,94 @@ func TestPacer_SpacesEveryCallButTheFirst(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Per-day series
+// Per-day series: signal days, the refresh window, and the bookmark
 // ---------------------------------------------------------------------------
 
-func TestWalkPerDay_CostsOneCallPerDayAndRefusesToBackfill(t *testing.T) {
+// A per-day request costs one call and up to 88 KB, so the walk asks only for
+// days a cheaper series already shows a reading for. The calendar days in
+// between are not requested at all.
+func TestWalkPerDay_RequestsOnlySignalDaysOldestFirst(t *testing.T) {
 	db := testStore(t)
+	seedSignalDays(t, db, "2026-09-02", "2026-09-05", "2026-09-06")
 	api := &fakeGarmin{respond: func(c fakeCall, _ int) (json.RawMessage, error) {
 		return json.RawMessage(fmt.Sprintf(`{"calendarDate":%q,"restingHeartRate":52}`, c.params["date"])), nil
 	}}
-	w, _ := newTestWalker(t, db, api, garminWalkOptions{days: 5, backfill: true, now: fixedClock("2026-09-08")})
-	out := w.walkSeries(context.Background(), seriesNamed(t, "daily_hr"))
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{depth: sinceAll(), now: fixedClock("2026-09-08")})
+	out := w.walkPerDay(context.Background(), seriesNamed(t, "daily_hr"))
 	if out.errored {
 		t.Fatalf("per-day walk errored: %v", out.err)
 	}
-	if len(api.calls) != 5 {
-		t.Fatalf("made %d calls for --days 5, want 5", len(api.calls))
-	}
-	if !out.warned {
-		t.Fatal("--backfill against a per-day series must say plainly that it is bounded by --days")
-	}
-	if out.stored != 5 {
-		t.Fatalf("stored %d rows, want 5", out.stored)
+	got := requestedDays(api, "date")
+	want := []string{"2026-09-02", "2026-09-05", "2026-09-06"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("requested %v, want exactly the signal days %v, oldest first", got, want)
 	}
 	st, _ := db.GetGarminSeriesState("daily_hr")
-	if st.LastCompleteDay != "2026-09-07" {
-		t.Fatalf("last_complete_day = %q, want 2026-09-07", st.LastCompleteDay)
+	if st.EarliestDay != "2026-09-02" || st.LastCompleteDay != "2026-09-07" {
+		t.Fatalf("state = (%s..%s), want 2026-09-02..2026-09-07", st.EarliestDay, st.LastCompleteDay)
 	}
-	// Newest first, so an interrupted run keeps the most useful days.
-	if got := api.calls[0].params["date"]; got != "2026-09-08" {
-		t.Fatalf("first per-day call asked for %s, want today first", got)
+}
+
+// An activity is a signal day even when no wellness series recorded that day:
+// the account holder was demonstrably wearing something.
+func TestWalkPerDay_AnActivityDayIsASignalDay(t *testing.T) {
+	db := testStore(t)
+	if err := db.Upsert("activities", "555", json.RawMessage(`{"activityId":555,"startTimeLocal":"2026-09-03 07:15:00"}`)); err != nil {
+		t.Fatalf("seed activity: %v", err)
+	}
+	api := &fakeGarmin{respond: func(c fakeCall, _ int) (json.RawMessage, error) {
+		return json.RawMessage(fmt.Sprintf(`{"calendarDate":%q,"restingHeartRate":52}`, c.params["date"])), nil
+	}}
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{depth: sinceAll(), now: fixedClock("2026-09-08")})
+	w.walkPerDay(context.Background(), seriesNamed(t, "daily_hr"))
+	if got := requestedDays(api, "date"); strings.Join(got, ",") != "2026-09-03" {
+		t.Fatalf("requested %v, want just the day an activity started", got)
+	}
+}
+
+// A day asked for once is filled whether or not it carried data, and the
+// newest seven signal days are the only ones asked again.
+func TestWalkPerDay_SecondRunReAsksOnlyTheNewestSevenSignalDays(t *testing.T) {
+	db := testStore(t)
+	var seeded []string
+	for d := mustParseCivilDay("2026-08-20"); !d.after(mustParseCivilDay("2026-08-29")); d = d.addDays(1) {
+		seeded = append(seeded, d.String())
+	}
+	seedSignalDays(t, db, seeded...)
+	api := &fakeGarmin{respond: func(fakeCall, int) (json.RawMessage, error) {
+		return json.RawMessage(`{}`), nil
+	}}
+	first, _ := newTestWalker(t, db, api, garminWalkOptions{depth: sinceAll(), now: fixedClock("2026-09-08")})
+	if out := first.walkPerDay(context.Background(), seriesNamed(t, "daily_hr")); out.errored {
+		t.Fatalf("first run errored: %v", out.err)
+	}
+	if got := requestedDays(api, "date"); len(got) != 10 {
+		t.Fatalf("the first run asked for %d days, want all 10 signal days", len(got))
+	}
+	before := len(api.calls)
+
+	second, _ := newTestWalker(t, db, api, garminWalkOptions{now: fixedClock("2026-09-08")})
+	if out := second.walkPerDay(context.Background(), seriesNamed(t, "daily_hr")); out.errored {
+		t.Fatalf("second run errored: %v", out.err)
+	}
+	again := requestedDays(api, "date")[before:]
+	// The seven newest of the ten seeded days, spelled out: a refresh
+	// window that quietly shrank or grew would pass a test that derived
+	// this list from the constant it is checking.
+	want := []string{"2026-08-23", "2026-08-24", "2026-08-25", "2026-08-26", "2026-08-27", "2026-08-28", "2026-08-29"}
+	if strings.Join(again, ",") != strings.Join(want, ",") {
+		t.Fatalf("the second run re-asked %v; want exactly the newest seven signal days %v — every older day was already requested and answered, empty or not",
+			again, want)
 	}
 }
 
 func TestWalkPerDay_EmptyDayIsNotAnError(t *testing.T) {
 	db := testStore(t)
+	seedSignalDays(t, db, "2026-09-06", "2026-09-07")
 	api := &fakeGarmin{respond: func(fakeCall, int) (json.RawMessage, error) {
 		return json.RawMessage(`{}`), nil
 	}}
-	w, _ := newTestWalker(t, db, api, garminWalkOptions{days: 3, now: fixedClock("2026-09-08")})
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{depth: sinceAll(), now: fixedClock("2026-09-08")})
 	out := w.walkSeries(context.Background(), seriesNamed(t, "daily_hr"))
 	if out.errored {
 		t.Fatalf("a day with no readings must be an empty result, not a failure: %v", out.err)
@@ -508,22 +634,27 @@ func TestWalkPerDay_EmptyDayIsNotAnError(t *testing.T) {
 // Activity feed and its per-activity fan-out
 // ---------------------------------------------------------------------------
 
-func TestWalkActivities_PagesWithStartNotOffset(t *testing.T) {
-	db := testStore(t)
-	total := 250
-	api := &fakeGarmin{respond: func(c fakeCall, _ int) (json.RawMessage, error) {
-		start := 0
+// ascendingFeed answers the feed the way Garmin does under sortOrder=asc:
+// oldest first, `start` counting from the oldest.
+func ascendingFeed(total int, oldest string) func(fakeCall, int) (json.RawMessage, error) {
+	return func(c fakeCall, _ int) (json.RawMessage, error) {
+		start, limit := 0, 0
 		fmt.Sscanf(c.params["start"], "%d", &start)
-		limit := 0
 		fmt.Sscanf(c.params["limit"], "%d", &limit)
 		var rows []string
 		for i := start; i < start+limit && i < total; i++ {
-			day := mustParseCivilDay("2026-09-08").addDays(-i)
+			day := mustParseCivilDay(oldest).addDays(i)
 			rows = append(rows, fmt.Sprintf(`{"activityId":%d,"startTimeLocal":"%s 07:00:00"}`, 900000+i, day.String()))
 		}
 		return json.RawMessage("[" + strings.Join(rows, ",") + "]"), nil
-	}}
-	w, _ := newTestWalker(t, db, api, garminWalkOptions{backfill: true, activityPageSize: 100, now: fixedClock("2026-09-08")})
+	}
+}
+
+func TestWalkActivities_PagesAscendingWithStartNotOffset(t *testing.T) {
+	db := testStore(t)
+	total := 250
+	api := &fakeGarmin{respond: ascendingFeed(total, "2026-01-01")}
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{depth: sinceAll(), activityPageSize: 100, now: fixedClock("2026-09-08")})
 	out := w.walkSeries(context.Background(), seriesNamed(t, "activities"))
 	if out.errored {
 		t.Fatalf("activity walk errored: %v", out.err)
@@ -531,47 +662,60 @@ func TestWalkActivities_PagesWithStartNotOffset(t *testing.T) {
 	if out.stored != total {
 		t.Fatalf("stored %d activities, want %d", out.stored, total)
 	}
-	if len(api.calls) != 3 {
-		t.Fatalf("made %d calls, want 3 (100+100+50)", len(api.calls))
+	// One floor probe plus three pages.
+	if len(api.calls) != 4 {
+		t.Fatalf("made %d calls, want 4 (one floor probe, then 100+100+50)", len(api.calls))
+	}
+	if api.calls[0].params["limit"] != "1" || api.calls[0].params["sortOrder"] != "asc" {
+		t.Fatalf("the first call was %v, want the one-request floor probe sortOrder=asc&limit=1", api.calls[0].params)
 	}
 	wantStarts := []string{"0", "100", "200"}
-	for i, c := range api.calls {
+	for i, c := range api.calls[1:] {
 		if _, wrong := c.params["offset"]; wrong {
 			t.Fatal("the walk sent an `offset` parameter; verified live 2026-09-07 that Garmin ignores it and returns page 1 forever")
 		}
-		if c.params["start"] != wantStarts[i] {
-			t.Fatalf("call %d start = %q, want %q", i, c.params["start"], wantStarts[i])
+		if c.params["sortOrder"] != "asc" {
+			t.Fatalf("page %d asked for sortOrder=%q, want asc", i, c.params["sortOrder"])
 		}
+		if c.params["start"] != wantStarts[i] {
+			t.Fatalf("page %d start = %q, want %q", i, c.params["start"], wantStarts[i])
+		}
+		if c.params["startDate"] != "2026-01-01" {
+			t.Fatalf("page %d startDate = %q, want the probed floor 2026-01-01", i, c.params["startDate"])
+		}
+	}
+	st, _ := db.GetGarminSeriesState("activities")
+	if st.EarliestDay != "2026-01-01" || st.LastCompleteDay != "2026-09-07" {
+		t.Fatalf("state = (%s..%s), want 2026-01-01..2026-09-07", st.EarliestDay, st.LastCompleteDay)
+	}
+	if st.StopReason != "feed_exhausted" {
+		t.Fatalf("stop_reason = %q, want feed_exhausted", st.StopReason)
 	}
 }
 
-func TestWalkActivities_IncrementalStopsAtTheBookmark(t *testing.T) {
+// A second run asks from the bookmark day forward — including the bookmark day
+// itself, whose rows upsert, so an activity uploaded late that day is not lost.
+func TestWalkActivities_ForwardLegResumesFromTheBookmarkDay(t *testing.T) {
 	db := testStore(t)
 	if err := db.SaveGarminSeriesState(store.GarminSeriesState{
-		Series: "activities", LastCompleteDay: "2026-09-05", TotalRows: 3,
+		Series: "activities", EarliestDay: "2026-01-01", LastCompleteDay: "2026-09-05", TotalRows: 3,
 	}); err != nil {
 		t.Fatalf("seed state: %v", err)
 	}
-	api := &fakeGarmin{respond: func(c fakeCall, _ int) (json.RawMessage, error) {
-		start := 0
-		fmt.Sscanf(c.params["start"], "%d", &start)
-		var rows []string
-		for i := start; i < start+10; i++ {
-			day := mustParseCivilDay("2026-09-08").addDays(-i)
-			rows = append(rows, fmt.Sprintf(`{"activityId":%d,"startTimeLocal":"%s 07:00:00"}`, 900000+i, day.String()))
-		}
-		return json.RawMessage("[" + strings.Join(rows, ",") + "]"), nil
-	}}
+	api := &fakeGarmin{respond: ascendingFeed(4, "2026-09-05")}
 	w, _ := newTestWalker(t, db, api, garminWalkOptions{activityPageSize: 10, now: fixedClock("2026-09-08")})
 	out := w.walkSeries(context.Background(), seriesNamed(t, "activities"))
 	if out.errored {
 		t.Fatalf("incremental activity walk errored: %v", out.err)
 	}
 	if len(api.calls) != 1 {
-		t.Fatalf("made %d calls, want 1: the first page already reaches past the bookmark", len(api.calls))
+		t.Fatalf("made %d calls, want 1: a filled feed needs no floor probe and the first page ends the leg", len(api.calls))
 	}
-	if out.stored != 4 {
-		t.Fatalf("stored %d activities, want 4 (2026-09-08 back to 2026-09-05 inclusive)", out.stored)
+	if got := api.calls[0].params["startDate"]; got != "2026-09-05" {
+		t.Fatalf("startDate = %q, want the bookmark day 2026-09-05", got)
+	}
+	if _, bounded := api.calls[0].params["endDate"]; bounded {
+		t.Fatal("the forward leg must not bound its range at the top; today is the end of it")
 	}
 }
 
@@ -934,7 +1078,7 @@ func TestEmitter_UsesTheGeneratedSyncVocabulary(t *testing.T) {
 	var buf strings.Builder
 	e := &garminEmitter{w: &buf, machine: true}
 	e.start("steps")
-	e.progress("steps", 28, "2026-08-12..2026-09-08")
+	e.progress("steps", 28, "2026-08-12..2026-09-08", "2026-09-07")
 	e.warn("steps", "reason", "message")
 	e.anomaly("steps", "reason", 5, 0)
 	e.summary(28, 1, 1, 0, 0, 1500*time.Millisecond)
@@ -955,11 +1099,56 @@ func TestEmitter_UsesTheGeneratedSyncVocabulary(t *testing.T) {
 	}
 }
 
+// The progress event carries the bookmark, because the bookmark is where a
+// killed run resumes: a reader watching the stream can see exactly what
+// interrupting would cost.
+func TestEmitter_ProgressCarriesTheBookmark(t *testing.T) {
+	var buf strings.Builder
+	(&garminEmitter{w: &buf, machine: true}).progress("steps", 28, "2026-08-12..2026-09-08", "2026-09-07")
+	var probe map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(buf.String())), &probe); err != nil {
+		t.Fatalf("progress is not JSON: %s", buf.String())
+	}
+	if probe["bookmark"] != "2026-09-07" {
+		t.Fatalf("progress bookmark = %v, want 2026-09-07", probe["bookmark"])
+	}
+}
+
+// sync_estimate is the one event name outside the generated vocabulary. It is
+// here on purpose: nothing generated means "this is what the next few thousand
+// requests will cost", and hanging a projection off sync_progress would have
+// made a forecast look like work already done.
+func TestEmitter_EstimateIsItsOwnEventAndSilentInHumanMode(t *testing.T) {
+	var machine strings.Builder
+	(&garminEmitter{w: &machine, machine: true}).estimate(garminWorkEstimate{
+		Since: "2011-10-29", Requests: 4812, Minutes: 34.2, Megabytes: 501.4,
+	})
+	var probe map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(machine.String())), &probe); err != nil {
+		t.Fatalf("estimate is not JSON: %s", machine.String())
+	}
+	if probe["event"] != "sync_estimate" || probe["requests"] != float64(4812) || probe["since"] != "2011-10-29" {
+		t.Fatalf("estimate event = %v", probe)
+	}
+
+	var events, notes strings.Builder
+	(&garminEmitter{w: &events, noteW: &notes}).estimate(garminWorkEstimate{
+		Since: "2011-10-29", Requests: 4812, Minutes: 34.2, Megabytes: 501.4,
+	})
+	if events.Len() != 0 {
+		t.Fatalf("the human estimate landed in the event stream: %q", events.String())
+	}
+	if !strings.Contains(notes.String(), "About 4812 requests") {
+		t.Fatalf("the human estimate line was %q", notes.String())
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Catalog invariants
 // ---------------------------------------------------------------------------
 
 func TestSeriesCatalog_IsInternallyConsistent(t *testing.T) {
+	db := testStore(t)
 	seen := map[string]bool{}
 	resources := map[string]bool{}
 	for _, s := range garminSeriesCatalog() {
@@ -1005,9 +1194,13 @@ func TestSeriesCatalog_IsInternallyConsistent(t *testing.T) {
 		if kindName(s.kind) == "unknown" {
 			t.Fatalf("series %q has a kind kindName does not name", s.name)
 		}
-		planned := planGarminForwardWork([]garminSeries{s}, mustParseCivilDay("2026-09-08"), 28)[0]
-		if planned.Requests == 0 && planned.Note == "" {
-			t.Fatalf("series %q plans as zero requests with no note; planGarminForwardWork has no case for its kind", s.name)
+		planner := &garminPlanner{db: db, depth: sinceAll(), now: fixedClock("2026-09-08"), loc: time.UTC}
+		planned, err := planner.seriesPlan(s)
+		if err != nil {
+			t.Fatalf("series %q could not be planned: %v", s.name, err)
+		}
+		if planned.Outstanding == 0 && planned.Note == "" {
+			t.Fatalf("series %q plans as zero requests with no note; the planner has no case for its kind", s.name)
 		}
 	}
 	if len(garminSeriesNames()) != len(garminSeriesCatalog()) {
@@ -1015,39 +1208,23 @@ func TestSeriesCatalog_IsInternallyConsistent(t *testing.T) {
 	}
 }
 
-// A first `history` run must not silently walk the activity feed back to the
-// account's first ever activity while every other series covers --days.
-func TestWalkActivities_FirstRunIsClampedToTheDaysHorizon(t *testing.T) {
+// --since DATE bounds the feed at that date, and needs no floor probe: the
+// caller has already said where to start.
+func TestWalkActivities_SinceDateIsTheFloorAndSkipsTheProbe(t *testing.T) {
 	db := testStore(t)
-	api := &fakeGarmin{respond: func(c fakeCall, _ int) (json.RawMessage, error) {
-		start := 0
-		fmt.Sscanf(c.params["start"], "%d", &start)
-		limit := 0
-		fmt.Sscanf(c.params["limit"], "%d", &limit)
-		var rows []string
-		for i := start; i < start+limit; i++ {
-			day := mustParseCivilDay("2026-09-08").addDays(-i)
-			rows = append(rows, fmt.Sprintf(`{"activityId":%d,"startTimeLocal":"%s 07:00:00"}`, 900000+i, day.String()))
-		}
-		return json.RawMessage("[" + strings.Join(rows, ",") + "]"), nil
-	}}
-	w, _ := newTestWalker(t, db, api, garminWalkOptions{days: 7, activityPageSize: 10, now: fixedClock("2026-09-08")})
+	api := &fakeGarmin{respond: ascendingFeed(5, "2026-09-02")}
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{
+		depth: sinceDay("2026-09-02"), activityPageSize: 10, now: fixedClock("2026-09-08"),
+	})
 	out := w.walkSeries(context.Background(), seriesNamed(t, "activities"))
 	if out.errored {
-		t.Fatalf("clamped activity walk errored: %v", out.err)
-	}
-	if out.stored != 7 {
-		t.Fatalf("stored %d activities for --days 7, want 7; an unbounded first run would page the whole feed", out.stored)
+		t.Fatalf("dated activity walk errored: %v", out.err)
 	}
 	if len(api.calls) != 1 {
-		t.Fatalf("made %d calls; the first page already crosses the 7-day horizon", len(api.calls))
+		t.Fatalf("made %d calls, want 1: --since names the floor, so no probe is needed and one page ends the leg", len(api.calls))
 	}
-
-	// --backfill is what asks for the whole feed.
-	deep, _ := newTestWalker(t, db, api, garminWalkOptions{days: 7, backfill: true, maxPages: 3, activityPageSize: 10, now: fixedClock("2026-09-08")})
-	deepOut := deep.walkSeries(context.Background(), seriesNamed(t, "activities"))
-	if deepOut.stored <= 7 {
-		t.Fatalf("--backfill stored %d activities, want it to page past the --days horizon", deepOut.stored)
+	if got := api.calls[0].params["startDate"]; got != "2026-09-02" {
+		t.Fatalf("startDate = %q, want the --since date 2026-09-02", got)
 	}
 }
 
@@ -1059,7 +1236,7 @@ func TestWalkSeries_WarnsWhenASeriesHasNeverStoredARow(t *testing.T) {
 		return json.RawMessage(`[]`), nil
 	}}
 	var buf strings.Builder
-	w, _ := newTestWalker(t, db, api, garminWalkOptions{days: 3, now: fixedClock("2026-09-08")})
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{depth: sinceDay("2026-09-06"), now: fixedClock("2026-09-08")})
 	w.emit = &garminEmitter{w: &buf, machine: true}
 	out := w.walkSeries(context.Background(), seriesNamed(t, "training_readiness"))
 	if out.errored {
@@ -1085,7 +1262,7 @@ func TestWalk_StopsAfterAWallOfConsecutiveFailures(t *testing.T) {
 		return nil, fmt.Errorf("GET %s returned HTTP 403: {\"error\":\"ForbiddenException\"}", c.path)
 	}}
 	w, _ := newTestWalker(t, db, api, garminWalkOptions{
-		days: 3650, maxConsecutiveFailures: 5, now: fixedClock("2026-09-08"),
+		depth: sinceAll(), maxConsecutiveFailures: 5, now: fixedClock("2026-09-08"),
 	})
 	out := w.walkSeries(context.Background(), seriesNamed(t, "steps"))
 	if !out.errored {
@@ -1111,7 +1288,7 @@ func TestWalk_ASuccessResetsTheFailureCounter(t *testing.T) {
 	}}
 	// 280 days is ten 28-day windows; five of them fail, none consecutively.
 	w, _ := newTestWalker(t, db, api, garminWalkOptions{
-		days: 280, maxConsecutiveFailures: 3, now: fixedClock("2026-09-08"),
+		depth: sinceDay("2025-12-03"), maxConsecutiveFailures: 3, now: fixedClock("2026-09-08"),
 	})
 	out := w.walkSeries(context.Background(), seriesNamed(t, "steps"))
 	if out.errored {
@@ -1139,7 +1316,7 @@ func TestWalkWindowed_AMiddleWindowFailureStopsTheBookmark(t *testing.T) {
 		return stepsWindowPayload(c.path), nil
 	}}
 	// 84 days = three windows: 06-17..07-14, 07-15..08-11, 08-12..09-08.
-	w, _ := newTestWalker(t, db, api, garminWalkOptions{days: 84, now: fixedClock("2026-09-08")})
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{depth: sinceDay("2026-06-17"), now: fixedClock("2026-09-08")})
 	out := w.walkSeries(context.Background(), seriesNamed(t, "steps"))
 	if out.errored {
 		t.Fatalf("walk errored: %v", out.err)
@@ -1162,7 +1339,7 @@ func TestWalkWindowed_AMiddleWindowFailureStopsTheBookmark(t *testing.T) {
 	// The next run therefore re-requests the gap rather than skipping it.
 	callsBefore := len(api.calls)
 	api.respond = func(c fakeCall, _ int) (json.RawMessage, error) { return stepsWindowPayload(c.path), nil }
-	resume, _ := newTestWalker(t, db, api, garminWalkOptions{days: 84, now: fixedClock("2026-09-08")})
+	resume, _ := newTestWalker(t, db, api, garminWalkOptions{depth: sinceDay("2026-06-17"), now: fixedClock("2026-09-08")})
 	if out2 := resume.walkSeries(context.Background(), seriesNamed(t, "steps")); out2.errored || out2.warned {
 		t.Fatalf("resume did not run clean: warned=%v err=%v", out2.warned, out2.err)
 	}
@@ -1404,22 +1581,19 @@ func TestArchivePathIgnoresFilesThatAreNotScopedArchives(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // Garmin answers HTTP 403 to a date range that reaches past the start of the
-// account's history. Observed live on 2026-09-12: `history --backfill` exited
-// 5 because the first backward window of intensity_minutes was refused and ten
-// refusals in a row across the ranged series read as a dead credential, so the
-// run stopped before activities and the per-day series were attempted. In the
-// backward leg a refusal is the account's history start, so it counts as an
-// empty window and never counts toward the wall.
-func TestWalkWindowed_BackfillTreatsARefusedWindowAsTheHistoryStart(t *testing.T) {
+// account's history — and to a credential that has died, with nothing in the
+// response to tell them apart. Two facts about the walk do: the series has
+// stored nothing, and Garmin has already answered something in this run. Both
+// hold here, so the refused windows are stepped over and the bookmark lands
+// above them.
+func TestWalkWindowed_APreHistoryRefusalIsAnEmptyWindowOnceGarminHasAnswered(t *testing.T) {
 	db := testStore(t)
-	// Garmin serves windows from 2026-06-17 onward and refuses everything
-	// older, the way it does for a range past the account's first data.
 	cutoff := mustParseCivilDay("2026-06-17")
 	api := &fakeGarmin{respond: func(c fakeCall, _ int) (json.RawMessage, error) {
 		if strings.HasPrefix(c.path, "/sleep-service/stats/sleep/daily/") {
-			return json.RawMessage(`{"individualStats":[]}`), nil
+			return json.RawMessage(`{"individualStats":[{"calendarDate":"2026-09-01"}]}`), nil
 		}
-		start := mustParseCivilDay(strings.Split(strings.TrimPrefix(c.path, "/usersummary-service/stats/steps/daily/"), "/")[0])
+		start := mustParseCivilDay(strings.Split(strings.TrimPrefix(c.path, stepsPrefix), "/")[0])
 		if start.before(cutoff) {
 			return nil, fmt.Errorf("GET %s returned HTTP 403: {\"error\":\"ForbiddenException\"}", c.path)
 		}
@@ -1427,83 +1601,137 @@ func TestWalkWindowed_BackfillTreatsARefusedWindowAsTheHistoryStart(t *testing.T
 	}}
 	var buf strings.Builder
 	w, _ := newTestWalker(t, db, api, garminWalkOptions{
-		days: 28, backfill: true, emptyWindowCeiling: 3, now: fixedClock("2026-09-08"),
+		depth: sinceDay("2026-01-01"), now: fixedClock("2026-09-08"),
 	})
 	w.emit = &garminEmitter{w: &buf, machine: true}
 
+	// sleep_stats answers 200, which is the half of the test that speaks
+	// for the credential.
+	if out := w.walkSeries(context.Background(), seriesNamed(t, "sleep_stats")); out.errored {
+		t.Fatalf("the first series errored: %v", out.err)
+	}
 	out := w.walkSeries(context.Background(), seriesNamed(t, "steps"))
 	if out.errored {
-		t.Fatalf("a refused window must not error the series: %v", out.err)
+		t.Fatalf("a refused pre-history window must not error the series: %v", out.err)
 	}
 	if !out.warned {
-		t.Fatal("a walk that stopped because Garmin refused the next window must say so")
+		t.Fatal("a walk that stepped over refused windows must say so")
 	}
 	if w.consecutiveFailures != 0 {
 		t.Fatalf("consecutive_failures = %d; a refusal at the history edge must not count toward the wall", w.consecutiveFailures)
 	}
 
 	st, _ := db.GetGarminSeriesState("steps")
-	if st.StopReason != "window_denied_stop" {
-		t.Fatalf("stop_reason = %q, want window_denied_stop", st.StopReason)
+	if st.StopReason != "" {
+		t.Fatalf("stop_reason = %q, want empty: the series completed", st.StopReason)
 	}
-	if st.EmptyWindows != 3 {
-		t.Fatalf("empty_windows = %d, want exactly the ceiling of 3", st.EmptyWindows)
+	if st.LastCompleteDay != "2026-09-07" {
+		t.Fatalf("last_complete_day = %q, want 2026-09-07: the bookmark passes over the refused range once a window answers", st.LastCompleteDay)
 	}
-	if st.EarliestDay != "2026-06-17" {
-		t.Fatalf("earliest_day = %q, want 2026-06-17: the start of the oldest window Garmin served", st.EarliestDay)
+	if st.EarliestDay != "2026-01-01" {
+		t.Fatalf("earliest_day = %q, want the requested floor 2026-01-01", st.EarliestDay)
 	}
 
-	denials := strings.Count(buf.String(), `"reason":"window_denied_stop"`)
+	denials := strings.Count(buf.String(), `"reason":"window_denied"`)
 	if denials != 1 {
-		t.Fatalf("emitted %d window_denied_stop warnings, want exactly 1:\n%s", denials, buf.String())
+		t.Fatalf("emitted %d window_denied warnings, want exactly 1:\n%s", denials, buf.String())
 	}
-	if !strings.Contains(buf.String(), "2026-06-17..2026-07-14") {
-		t.Fatalf("the warning does not name the earliest window that was served:\n%s", buf.String())
+	if !strings.Contains(buf.String(), "refused 6 window(s)") {
+		t.Fatalf("the warning does not count the refusals:\n%s", buf.String())
 	}
-	if strings.Contains(buf.String(), "window_fetch_failed") {
-		t.Fatalf("a refused window was reported as a fetch failure:\n%s", buf.String())
-	}
-
-	// The blast radius is the point: the next series still runs on the same
-	// walker, which before the fix it did not — the wall ended the whole run.
-	sleepOut := w.walkSeries(context.Background(), seriesNamed(t, "sleep_stats"))
-	if sleepOut.errored {
-		t.Fatalf("the series after the refused one did not run: %v", sleepOut.err)
-	}
-	if len(api.pathsMatching("/sleep-service/stats/sleep/daily/")) == 0 {
-		t.Fatal("no request was made for the series after the refused one")
+	if strings.Contains(buf.String(), `"reason":"window_fetch_failed"`) {
+		t.Fatalf("a refused pre-history window was reported as a fetch failure:\n%s", buf.String())
 	}
 }
 
-// A 403 in the forward leg is a different fact: those windows are inside the
-// account's lifetime, so a refusal there is a fault and still counts toward
-// the wall that ends a run against a dead credential.
-func TestWalkWindowed_ForwardLegStillCountsA403AsAFailure(t *testing.T) {
+// The discriminating case: a 403 before Garmin has answered ANYTHING in this
+// run is a credential that does not work, not a date before the account
+// existed. It counts toward the wall and the bookmark does not move — which is
+// what stops a dead token from walking a first fill to "complete, 0 rows".
+func TestWalkWindowed_ARefusalBeforeAnyAnswerCountsTowardTheWall(t *testing.T) {
 	db := testStore(t)
+	api := &fakeGarmin{respond: func(c fakeCall, _ int) (json.RawMessage, error) {
+		return nil, fmt.Errorf("GET %s returned HTTP 403: {\"error\":\"ForbiddenException\"}", c.path)
+	}}
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{
+		depth: sinceAll(), maxConsecutiveFailures: 5, now: fixedClock("2026-09-08"),
+	})
+	out := w.walkSeries(context.Background(), seriesNamed(t, "steps"))
+	if !out.errored || !errors.Is(out.err, errGarminWallOfFailures) {
+		t.Fatalf("a run whose every request is refused must hit the wall; got errored=%v err=%v", out.errored, out.err)
+	}
+	if len(api.calls) != 5 {
+		t.Fatalf("made %d calls, want exactly the 5-failure limit: an excused 403 would have walked all 257 windows", len(api.calls))
+	}
+	st, _ := db.GetGarminSeriesState("steps")
+	if st.LastCompleteDay != "" || st.EarliestDay != "" {
+		t.Fatalf("state = (%q..%q), want both unset: nothing was proven", st.EarliestDay, st.LastCompleteDay)
+	}
+}
+
+// A series Garmin refused from end to end is not complete, whatever the
+// refusals meant. The failure prevented: a blocked token turning a first fill
+// into a silent "complete, no data".
+func TestWalkWindowed_ASeriesRefusedThroughoutIsNotMarkedComplete(t *testing.T) {
+	db := testStore(t)
+	api := &fakeGarmin{respond: func(c fakeCall, _ int) (json.RawMessage, error) {
+		if strings.HasPrefix(c.path, "/sleep-service/stats/sleep/daily/") {
+			return json.RawMessage(`{"individualStats":[{"calendarDate":"2026-09-01"}]}`), nil
+		}
+		return nil, fmt.Errorf("GET %s returned HTTP 403: {\"error\":\"ForbiddenException\"}", c.path)
+	}}
+	var buf strings.Builder
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{
+		depth: sinceDay("2026-08-12"), now: fixedClock("2026-09-08"),
+	})
+	w.emit = &garminEmitter{w: &buf, machine: true}
+	w.walkSeries(context.Background(), seriesNamed(t, "sleep_stats"))
+	out := w.walkSeries(context.Background(), seriesNamed(t, "steps"))
+	if out.errored {
+		t.Fatalf("an all-refused series must warn, not error: %v", out.err)
+	}
+	st, _ := db.GetGarminSeriesState("steps")
+	if st.StopReason != "all_windows_refused" {
+		t.Fatalf("stop_reason = %q, want all_windows_refused", st.StopReason)
+	}
+	if st.LastCompleteDay != "" {
+		t.Fatalf("last_complete_day = %q, want it unmoved: nothing was fetched", st.LastCompleteDay)
+	}
+	if !strings.Contains(buf.String(), "all_windows_refused") {
+		t.Fatalf("the run did not report the refusal:\n%s", buf.String())
+	}
+}
+
+// A 403 on a series that already holds rows is a fault, not a history edge:
+// this account demonstrably reaches that far back.
+func TestWalkWindowed_A403OnASeriesWithRowsCountsAsAFailure(t *testing.T) {
+	db := testStore(t)
+	seedSignalDays(t, db, "2026-08-01")
 	api := &fakeGarmin{respond: func(c fakeCall, _ int) (json.RawMessage, error) {
 		return nil, fmt.Errorf("GET %s returned HTTP 403: {\"error\":\"ForbiddenException\"}", c.path)
 	}}
 	var buf strings.Builder
 	w, _ := newTestWalker(t, db, api, garminWalkOptions{
-		days: 28, maxConsecutiveFailures: 10, now: fixedClock("2026-09-08"),
+		depth: sinceDay("2026-08-12"), maxConsecutiveFailures: 10, now: fixedClock("2026-09-08"),
 	})
+	w.sawHTTP200 = true
 	w.emit = &garminEmitter{w: &buf, machine: true}
 
-	out := w.walkSeries(context.Background(), seriesNamed(t, "steps"))
+	out := w.walkWindowed(context.Background(), seriesNamed(t, "steps"))
 	if out.errored {
-		t.Fatalf("one refused forward window must warn, not end the run: %v", out.err)
+		t.Fatalf("one refused window must warn, not end the run: %v", out.err)
 	}
 	if !out.warned {
-		t.Fatal("a refused forward window must warn")
+		t.Fatal("a refused window on a series with rows must warn")
 	}
 	if w.consecutiveFailures != 1 {
-		t.Fatalf("consecutive_failures = %d, want 1: a forward-leg 403 still counts toward the wall", w.consecutiveFailures)
+		t.Fatalf("consecutive_failures = %d, want 1: this account reaches that far back, so the refusal is a fault", w.consecutiveFailures)
 	}
 	if !strings.Contains(buf.String(), `"reason":"window_fetch_failed"`) {
-		t.Fatalf("the forward failure was not reported:\n%s", buf.String())
+		t.Fatalf("the failure was not reported:\n%s", buf.String())
 	}
-	if strings.Contains(buf.String(), "window_denied_stop") {
-		t.Fatalf("a forward-leg 403 was excused as a history edge:\n%s", buf.String())
+	if strings.Contains(buf.String(), "window_denied") {
+		t.Fatalf("a 403 on a series with rows was excused as a history edge:\n%s", buf.String())
 	}
 }
 
@@ -1523,5 +1751,427 @@ func TestIsForbidden_MatchesTheStatusTheClientPrints(t *testing.T) {
 		if got := isForbidden(err); got != want {
 			t.Fatalf("isForbidden(%q) = %v, want %v", msg, got, want)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Oldest-first, and what a kill costs
+// ---------------------------------------------------------------------------
+
+// Every shape of series walks oldest day first. It is the property that makes
+// one bookmark enough: "filled through X" is only true if nothing below X was
+// skipped on the way up.
+func TestWalk_EveryKindRequestsOldestFirst(t *testing.T) {
+	db := testStore(t)
+	seedSignalDays(t, db, "2026-08-20", "2026-08-25", "2026-09-01", "2026-09-04")
+	api := &fakeGarmin{respond: func(c fakeCall, _ int) (json.RawMessage, error) {
+		switch {
+		case strings.HasPrefix(c.path, stepsPrefix):
+			return stepsWindowPayload(c.path), nil
+		case strings.HasPrefix(c.path, garminActivityFeedPath):
+			return ascendingFeed(12, "2026-08-01")(c, 0)
+		default:
+			return json.RawMessage(fmt.Sprintf(`{"calendarDate":%q}`, c.params["date"])), nil
+		}
+	}}
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{
+		depth: sinceDay("2026-06-17"), activityPageSize: 5, now: fixedClock("2026-09-08"),
+	})
+
+	w.walkSeries(context.Background(), seriesNamed(t, "steps"))
+	assertAscending(t, "windowed requests", windowStarts(api, stepsPrefix))
+
+	before := len(api.calls)
+	w.walkSeries(context.Background(), seriesNamed(t, "daily_hr"))
+	assertAscending(t, "per-day requests", requestedDays(api, "date"))
+	if len(api.calls) == before {
+		t.Fatal("the per-day series made no request, so its order proves nothing")
+	}
+
+	before = len(api.calls)
+	w.walkSeries(context.Background(), seriesNamed(t, "activities"))
+	var feedStarts []string
+	for _, c := range api.calls[before:] {
+		if c.params["sortOrder"] != "asc" {
+			t.Fatalf("a feed page asked for sortOrder=%q, want asc", c.params["sortOrder"])
+		}
+		feedStarts = append(feedStarts, c.params["start"])
+	}
+	if len(feedStarts) < 2 {
+		t.Fatalf("the feed made %d requests; paging order proves nothing below two", len(feedStarts))
+	}
+}
+
+// Killing a per-day run mid-walk must cost the refresh window and nothing
+// more: every day below it was already requested and answered.
+func TestWalkPerDay_AKilledRunResumesWithoutRepeatingTheDaysBelowTheRefreshWindow(t *testing.T) {
+	db := testStore(t)
+	var days []string
+	for d := mustParseCivilDay("2026-08-20"); !d.after(mustParseCivilDay("2026-08-31")); d = d.addDays(1) {
+		days = append(days, d.String())
+	}
+	seedSignalDays(t, db, days...)
+
+	// The tenth per-day request dies, the way a SIGKILL mid-run does.
+	perDayCalls := 0
+	api := &fakeGarmin{respond: func(c fakeCall, _ int) (json.RawMessage, error) {
+		perDayCalls++
+		if perDayCalls > 9 {
+			return nil, errors.New("connection reset by peer")
+		}
+		return json.RawMessage(`{}`), nil
+	}}
+	first, _ := newTestWalker(t, db, api, garminWalkOptions{depth: sinceAll(), now: fixedClock("2026-09-08")})
+	first.walkPerDay(context.Background(), seriesNamed(t, "daily_hr"))
+	st, _ := db.GetGarminSeriesState("daily_hr")
+	if st.LastCompleteDay != "2026-08-28" {
+		t.Fatalf("last_complete_day after the kill = %q, want 2026-08-28 (the ninth signal day)", st.LastCompleteDay)
+	}
+	before := len(api.calls)
+
+	api.respond = func(fakeCall, int) (json.RawMessage, error) { return json.RawMessage(`{}`), nil }
+	resume, _ := newTestWalker(t, db, api, garminWalkOptions{now: fixedClock("2026-09-08")})
+	resume.walkPerDay(context.Background(), seriesNamed(t, "daily_hr"))
+	again := requestedDays(api, "date")[before:]
+
+	// The newest seven complete signal days are re-asked on purpose; the
+	// two below them are not, and the unfinished tail is picked up.
+	want := append(append([]string{}, days[2:9]...), days[9:]...)
+	if strings.Join(again, ",") != strings.Join(want, ",") {
+		t.Fatalf("the resume asked for %v, want %v: the refresh window plus the unfinished tail, and nothing older", again, want)
+	}
+	for _, asked := range again {
+		if asked == days[0] || asked == days[1] {
+			t.Fatalf("the resume re-asked %s, a day the killed run had already requested and answered", asked)
+		}
+	}
+}
+
+// A killed feed run resumes from its bookmark rather than paging the archive
+// from the floor again.
+func TestWalkActivities_AKilledRunResumesFromTheBookmarkDay(t *testing.T) {
+	db := testStore(t)
+	feed := ascendingFeed(25, "2026-08-01")
+	pages := 0
+	api := &fakeGarmin{respond: func(c fakeCall, n int) (json.RawMessage, error) {
+		if c.params["limit"] == "1" {
+			return feed(c, n)
+		}
+		pages++
+		if pages > 2 {
+			return nil, errors.New("connection reset by peer")
+		}
+		return feed(c, n)
+	}}
+	first, _ := newTestWalker(t, db, api, garminWalkOptions{depth: sinceAll(), activityPageSize: 10, now: fixedClock("2026-09-08")})
+	first.walkActivities(context.Background(), seriesNamed(t, "activities"))
+	st, _ := db.GetGarminSeriesState("activities")
+	if st.LastCompleteDay != "2026-08-20" {
+		t.Fatalf("bookmark after the kill = %q, want 2026-08-20 (the newest day of the second page)", st.LastCompleteDay)
+	}
+	if st.StopReason != "interrupted" {
+		t.Fatalf("stop_reason = %q, want interrupted", st.StopReason)
+	}
+	before := len(api.calls)
+
+	api.respond = feed
+	resume, _ := newTestWalker(t, db, api, garminWalkOptions{activityPageSize: 10, now: fixedClock("2026-09-08")})
+	resume.walkActivities(context.Background(), seriesNamed(t, "activities"))
+	if got := api.calls[before].params["startDate"]; got != "2026-08-20" {
+		t.Fatalf("the resume started at %q, want the bookmark day 2026-08-20 rather than the floor", got)
+	}
+	if _, probed := api.calls[before].params["limit"]; api.calls[before].params["limit"] == "1" {
+		t.Fatalf("the resume probed the feed floor again (%v); the archive already knows it", probed)
+	}
+}
+
+// State written by the retired backward walk cannot be resumed from: its
+// last_complete_day was the top of a range walked downwards, not the top of a
+// contiguous fill. Reading it as unfilled costs one re-walk of the windows and
+// is the only reading that cannot invent a range nobody fetched.
+func TestGarminSeriesFilled_RejectsStateFromTheRetiredBackwardWalk(t *testing.T) {
+	legacy := store.GarminSeriesState{
+		Series: "steps", EarliestDay: "2025-05-25", LastCompleteDay: "2026-09-12",
+		FrontierDay: "2024-04-29", StopReason: "empty_window_ceiling", EmptyWindows: 13,
+	}
+	if garminSeriesFilled(legacy) {
+		t.Fatal("a walk-version-0 row was read as a filled range; its bookmark means something else")
+	}
+	current := legacy
+	current.WalkVersion = store.GarminWalkVersion
+	if !garminSeriesFilled(current) {
+		t.Fatal("a row at the current walk version was read as unfilled")
+	}
+	current.LastCompleteDay = ""
+	if garminSeriesFilled(current) {
+		t.Fatal("a row with no bookmark was read as filled")
+	}
+}
+
+// A windowed series can walk 257 windows from the 2007 floor and store
+// nothing. That is either an account with no such data or a request shape this
+// tool has wrong, and an empty response cannot tell them apart — so the run
+// says so rather than leaving an empty table looking settled.
+func TestWalkSeries_AWindowedSeriesThatStoredNothingWarnsToo(t *testing.T) {
+	db := testStore(t)
+	api := &fakeGarmin{respond: func(fakeCall, int) (json.RawMessage, error) {
+		return json.RawMessage(`[]`), nil
+	}}
+	var buf strings.Builder
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{depth: sinceDay("2026-08-12"), now: fixedClock("2026-09-08")})
+	w.emit = &garminEmitter{w: &buf, machine: true}
+	out := w.walkSeries(context.Background(), seriesNamed(t, "steps"))
+	if out.errored {
+		t.Fatalf("an all-empty windowed walk must not error: %v", out.err)
+	}
+	if !out.warned {
+		t.Fatal("a windowed series that stored nothing across a whole run did not warn")
+	}
+	if !strings.Contains(buf.String(), "series_returned_no_rows") {
+		t.Fatalf("events did not carry the reason code:\n%s", buf.String())
+	}
+}
+
+// The cost estimate is printed at the first expensive series, which only means
+// "after the cheap series have filled the archive it reads" while the catalog
+// keeps the windowed series and the feed ahead of the fan-outs and the per-day
+// series. Reorder the catalog and a first run would estimate from an empty
+// archive and report almost nothing to do.
+func TestSeriesCatalog_CheapSeriesComeBeforeTheExpensiveOnes(t *testing.T) {
+	seenExpensive := ""
+	for _, s := range garminSeriesCatalog() {
+		if garminIsExpensiveKind(s.kind) {
+			if seenExpensive == "" {
+				seenExpensive = s.name
+			}
+			continue
+		}
+		if seenExpensive != "" && (s.kind == seriesWindowed || s.kind == seriesOffsetPaged) {
+			t.Fatalf("series %q (%s) is catalogued after the expensive series %q; the cost estimate is printed at the first expensive series and reads the days and ids the cheap ones store",
+				s.name, kindName(s.kind), seenExpensive)
+		}
+	}
+	if seenExpensive == "" {
+		t.Fatal("no expensive series in the catalog; the estimate would never be printed")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// A range endpoint is stamped only from days this run asked for
+// ---------------------------------------------------------------------------
+
+// legacyStateRow persists a state row at walk_version 0: the shape every
+// archive written by the retired backward walk holds. SaveGarminSeriesState
+// always stamps the current version, so the row is downgraded behind it, the
+// way a real legacy archive arrives.
+func legacyStateRow(t *testing.T, db *store.Store, path string, st store.GarminSeriesState) {
+	t.Helper()
+	if err := db.SaveGarminSeriesState(st); err != nil {
+		t.Fatalf("seed legacy state: %v", err)
+	}
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open archive for downgrade: %v", err)
+	}
+	defer func() { _ = raw.Close() }()
+	if _, err := raw.Exec(`UPDATE garmin_series_state SET walk_version = 0 WHERE series = ?`, st.Series); err != nil {
+		t.Fatalf("downgrade to walk_version 0: %v", err)
+	}
+	if reloaded, _ := db.GetGarminSeriesState(st.Series); reloaded.WalkVersion != 0 {
+		t.Fatalf("the fixture is at walk_version %d, want 0", reloaded.WalkVersion)
+	}
+}
+
+// garminResumableState is the one place the retired walk's range is dropped.
+// Its bookmark meant "the oldest day a row exists for", so keeping it would
+// certify coverage nothing requested.
+func TestGarminResumableState_DropsALegacyRangeAndKeepsACurrentOne(t *testing.T) {
+	legacy := store.GarminSeriesState{
+		Series: "steps", EarliestDay: "2020-07-06", LastCompleteDay: "2026-09-12",
+		StopReason: "empty_window_ceiling", TotalRows: 2260,
+	}
+	got := garminResumableState(legacy)
+	if got.EarliestDay != "" || got.LastCompleteDay != "" || got.StopReason != "" {
+		t.Fatalf("a walk-version-0 range survived: %+v", got)
+	}
+	if got.TotalRows != 2260 {
+		t.Fatalf("total_rows = %d; the stored rows are real and stay", got.TotalRows)
+	}
+	current := legacy
+	current.WalkVersion = store.GarminWalkVersion
+	if garminResumableState(current).EarliestDay != "2020-07-06" {
+		t.Fatal("a range this walk wrote was dropped")
+	}
+}
+
+// The row a run writes must describe what that run covered. Folding a legacy
+// earliest_day into it re-certifies a range at the current walk version, and a
+// later deeper --since then stops short of it forever.
+func TestWalkWindowed_ALegacyRangeIsNotRecertifiedAsThisWalksCoverage(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.db")
+	db, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.EnsureGarminSeriesState(); err != nil {
+		t.Fatalf("ensure series state: %v", err)
+	}
+	legacyStateRow(t, db, path, store.GarminSeriesState{
+		Series: "steps", EarliestDay: "2020-07-06", LastCompleteDay: "2026-09-12",
+		FrontierDay: "2019-06-24", StopReason: "empty_window_ceiling", EmptyWindows: 13, TotalRows: 2260,
+	})
+
+	api := &fakeGarmin{respond: func(c fakeCall, _ int) (json.RawMessage, error) {
+		return stepsWindowPayload(c.path), nil
+	}}
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{
+		depth: sinceDay("2026-06-01"), now: fixedClock("2026-09-13"),
+	})
+	w.walkWindowed(context.Background(), seriesNamed(t, "steps"))
+
+	starts := windowStarts(api, stepsPrefix)
+	if len(starts) == 0 || starts[0] != "2026-06-01" {
+		t.Fatalf("the run requested %v; want the first window at the --since floor 2026-06-01", starts)
+	}
+	st, _ := db.GetGarminSeriesState("steps")
+	if st.EarliestDay != "2026-06-01" {
+		t.Fatalf("earliest_day = %q at walk_version %d; the only windows this run asked for began %s",
+			st.EarliestDay, st.WalkVersion, starts[0])
+	}
+}
+
+// A per-day series with no signal day requests nothing, so it has covered
+// nothing: stamping a range at today would pin every later plain run above
+// every day the cheap series have yet to store.
+func TestWalkPerDay_NoSignalDayStampsNothingAndLeavesLaterRunsFree(t *testing.T) {
+	db := testStore(t)
+	api := &fakeGarmin{respond: func(fakeCall, int) (json.RawMessage, error) {
+		return json.RawMessage(`{}`), nil
+	}}
+	first, _ := newTestWalker(t, db, api, garminWalkOptions{depth: sinceAll(), now: fixedClock("2026-09-08")})
+	first.walkPerDay(context.Background(), seriesNamed(t, "daily_hr"))
+	if len(api.calls) != 0 {
+		t.Fatalf("the run made %d requests over an archive with no signal day", len(api.calls))
+	}
+	st, _ := db.GetGarminSeriesState("daily_hr")
+	if st.EarliestDay != "" || st.LastCompleteDay != "" {
+		t.Fatalf("a series that requested nothing claims the range %q..%q", st.EarliestDay, st.LastCompleteDay)
+	}
+	// The same "nothing to cover" answer reaches --status and --dry-run,
+	// whose SINCE column would otherwise read today.
+	plan, planErr := first.planner.seriesPlan(seriesNamed(t, "daily_hr"))
+	if planErr != nil {
+		t.Fatalf("plan: %v", planErr)
+	}
+	if plan.Since != "" {
+		t.Fatalf("the plan says the series covers from %q; no signal day exists to cover", plan.Since)
+	}
+
+	// The cheap series now store the history the first run could not see.
+	seedSignalDays(t, db, "2026-08-20", "2026-08-21", "2026-08-22")
+	second, _ := newTestWalker(t, db, api, garminWalkOptions{now: fixedClock("2026-09-08")})
+	second.walkPerDay(context.Background(), seriesNamed(t, "daily_hr"))
+	if got := requestedDays(api, "date"); strings.Join(got, ",") != "2026-08-20,2026-08-21,2026-08-22" {
+		t.Fatalf("the plain second run asked for %v; want the three signal days the archive now holds", got)
+	}
+}
+
+// --since <today> asks for a floor above the newest complete day. That is not
+// a range, so nothing is stamped from it and the next plain run still reaches
+// the history floor.
+func TestWalkWindowed_SinceTodayStampsNoRangeAndDoesNotPinTheDepth(t *testing.T) {
+	db := testStore(t)
+	api := &fakeGarmin{respond: func(c fakeCall, _ int) (json.RawMessage, error) {
+		return stepsWindowPayload(c.path), nil
+	}}
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{
+		depth: sinceDay("2026-09-08"), now: fixedClock("2026-09-08"),
+	})
+	w.walkWindowed(context.Background(), seriesNamed(t, "steps"))
+	st, _ := db.GetGarminSeriesState("steps")
+	if st.EarliestDay != "" {
+		t.Fatalf("earliest_day = %q over a floor above the newest complete day %q",
+			st.EarliestDay, st.LastCompleteDay)
+	}
+
+	before := len(api.calls)
+	w2, _ := newTestWalker(t, db, api, garminWalkOptions{depth: sinceAll(), now: fixedClock("2026-09-09")})
+	w2.walkWindowed(context.Background(), seriesNamed(t, "steps"))
+	starts := windowStarts(api, stepsPrefix)[before:]
+	if len(starts) == 0 || starts[0] != "2007-01-01" {
+		t.Fatalf("the later --since all started at %v; want the 2007-01-01 history floor", starts)
+	}
+}
+
+// An extension leg Garmin refused entirely proves nothing about the range it
+// asked for. Stamping the floor over it would mark the range covered while
+// the warning says the opposite, and no later run would ever ask again.
+func TestWalkWindowed_AnAllRefusedExtensionLegLeavesTheFloorAndIsRetriedLater(t *testing.T) {
+	db := testStore(t)
+	// A series filled shallowly that stored nothing: the shape a sparse
+	// account's sleep rows have.
+	if err := db.SaveGarminSeriesState(store.GarminSeriesState{
+		Series: "steps", EarliestDay: "2020-01-01", LastCompleteDay: "2026-09-07",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	refusing := &fakeGarmin{respond: func(c fakeCall, _ int) (json.RawMessage, error) {
+		if strings.HasPrefix(c.path, "/sleep-service/stats/sleep/daily/") {
+			return json.RawMessage(`{"individualStats":[{"calendarDate":"2026-09-01"}]}`), nil
+		}
+		return nil, fmt.Errorf("GET %s returned HTTP 403: {\"error\":\"ForbiddenException\"}", c.path)
+	}}
+	w, _ := newTestWalker(t, db, refusing, garminWalkOptions{
+		depth: sinceAll(), now: fixedClock("2026-09-08"), maxConsecutiveFailures: 500,
+	})
+	// One answered request first, which is what arms the pre-history reading
+	// of a 403 at all.
+	w.walkSeries(context.Background(), seriesNamed(t, "sleep_stats"))
+	w.walkSeries(context.Background(), seriesNamed(t, "steps"))
+
+	st, _ := db.GetGarminSeriesState("steps")
+	if st.StopReason != "all_windows_refused" {
+		t.Fatalf("stop_reason = %q, want all_windows_refused", st.StopReason)
+	}
+	if st.EarliestDay != "2020-01-01" {
+		t.Fatalf("earliest_day moved to %q over a range Garmin refused entirely", st.EarliestDay)
+	}
+
+	// The warning says the same range is asked for again next run. Prove it.
+	ok := &fakeGarmin{respond: func(c fakeCall, _ int) (json.RawMessage, error) {
+		return stepsWindowPayload(c.path), nil
+	}}
+	w2, _ := newTestWalker(t, db, ok, garminWalkOptions{depth: sinceAll(), now: fixedClock("2026-09-09")})
+	w2.walkWindowed(context.Background(), seriesNamed(t, "steps"))
+	starts := windowStarts(ok, stepsPrefix)
+	if len(starts) == 0 || starts[0] != "2007-01-01" {
+		t.Fatalf("the retry asked for %v; want the refused range again from 2007-01-01", starts)
+	}
+	if st2, _ := db.GetGarminSeriesState("steps"); st2.EarliestDay != "2007-01-01" {
+		t.Fatalf("earliest_day after the answered retry = %q, want 2007-01-01", st2.EarliestDay)
+	}
+}
+
+// The feed takes the same rule as the windowed and per-day walks: --since
+// <today> asks for a floor above the newest complete day, which is not a
+// range, so nothing is stamped from it and the depth stays open.
+func TestWalkActivities_SinceTodayStampsNoRangeAndDoesNotPinTheDepth(t *testing.T) {
+	db := testStore(t)
+	api := &fakeGarmin{respond: func(fakeCall, int) (json.RawMessage, error) {
+		return json.RawMessage(`[{"activityId":1,"startTimeLocal":"2026-09-08 06:00:00"}]`), nil
+	}}
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{
+		depth: sinceDay("2026-09-08"), now: fixedClock("2026-09-08"),
+	})
+	w.walkActivities(context.Background(), seriesNamed(t, "activities"))
+	st, _ := db.GetGarminSeriesState("activities")
+	if st.EarliestDay != "" {
+		t.Fatalf("the feed claims to be filled from %q while complete only through %q",
+			st.EarliestDay, st.LastCompleteDay)
+	}
+	if garminSeriesFilled(st) {
+		t.Fatal("a run that asked only for today left the feed reading as a filled range")
 	}
 }

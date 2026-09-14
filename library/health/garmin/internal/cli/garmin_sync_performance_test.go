@@ -5,7 +5,7 @@
 // The walk's cost is measured in API requests, not seconds: at the 300 ms
 // pacing every avoidable request is a third of a second of somebody's evening
 // and one more chance at a 429. These tests assert the plan — how many
-// requests each series shape costs for a given range — so a regression that
+// requests each series shape costs for a given depth — so a regression that
 // quietly turns a ranged series into a per-day one fails here rather than
 // showing up as an eleven-minute sync.
 
@@ -18,18 +18,26 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mvanhorn/printing-press-library/library/health/garmin/internal/store"
 )
+
+// planFor plans one series against a store, at a given depth.
+func planFor(t *testing.T, db *store.Store, s garminSeries, depth garminDepth) garminSeriesPlan {
+	t.Helper()
+	planner := &garminPlanner{db: db, depth: depth, now: fixedClock("2026-09-08"), loc: time.UTC}
+	plan, err := planner.seriesPlan(s)
+	if err != nil {
+		t.Fatalf("plan %s: %v", s.name, err)
+	}
+	return plan
+}
 
 // A series that pages by date range must never cost one request per day.
 func TestWalkPlan_RangedSeriesPageByWindowNotByDay(t *testing.T) {
-	end := mustParseCivilDay("2026-09-08")
+	db := testStore(t)
 	const days = 364
-
-	plan := planGarminForwardWork(garminSeriesCatalog(), end, days)
-	byName := map[string]garminPlanEntry{}
-	for _, p := range plan {
-		byName[p.Series] = p
-	}
+	depth := sinceDay("2025-09-10") // 364 days ending 2026-09-08
 
 	cases := []struct {
 		series    string
@@ -47,36 +55,21 @@ func TestWalkPlan_RangedSeriesPageByWindowNotByDay(t *testing.T) {
 		{"resting_hr", 364, 1},
 	}
 	for _, c := range cases {
-		got, ok := byName[c.series]
-		if !ok {
-			t.Fatalf("series %q is missing from the plan", c.series)
-		}
+		s := seriesNamed(t, c.series)
+		got := planFor(t, db, s, depth)
 		if got.Kind != "windowed" {
 			t.Fatalf("%s is planned as %q; it must page by date range", c.series, got.Kind)
 		}
-		if got.WindowDays != c.window {
-			t.Fatalf("%s window = %d days, want %d", c.series, got.WindowDays, c.window)
+		if s.windowDays != c.window {
+			t.Fatalf("%s window = %d days, want %d", c.series, s.windowDays, c.window)
 		}
-		if got.Requests != c.wantCalls {
+		if got.Outstanding != c.wantCalls {
 			t.Fatalf("%s costs %d requests for %d days, want %d — a per-day walk would cost %d",
-				c.series, got.Requests, days, c.wantCalls, days)
+				c.series, got.Outstanding, days, c.wantCalls, days)
 		}
-		if got.Requests >= days {
+		if got.Outstanding >= days {
 			t.Fatalf("%s costs %d requests for %d days: that is a per-day walk wearing a window's name",
-				c.series, got.Requests, days)
-		}
-	}
-
-	// The per-day series are honestly labelled as such, so nobody reads the
-	// plan and expects them to be cheap.
-	for _, name := range []string{"daily_summary", "sleep_detail", "daily_hr", "training_readiness"} {
-		got, ok := byName[name]
-		if !ok {
-			t.Fatalf("series %q is missing from the plan", name)
-		}
-		if got.Kind != "per_day" || got.Requests != days {
-			t.Fatalf("%s planned as %s at %d requests; a per-date endpoint costs exactly one request per day (%d)",
-				name, got.Kind, got.Requests, days)
+				c.series, got.Outstanding, days)
 		}
 	}
 }
@@ -84,23 +77,26 @@ func TestWalkPlan_RangedSeriesPageByWindowNotByDay(t *testing.T) {
 // The plan is not a projection someone hand-maintains: the walk must actually
 // make the number of calls the plan says it will.
 func TestWalkPlan_MatchesTheCallsTheWalkActuallyMakes(t *testing.T) {
-	const days = 364
-	end := mustParseCivilDay("2026-09-08")
+	depth := sinceDay("2025-09-10")
 
 	for _, name := range []string{"steps", "max_metrics", "intensity_minutes", "daily_hr"} {
 		t.Run(name, func(t *testing.T) {
 			db := testStore(t)
+			// daily_hr is a per-day series: it walks signal days, so give
+			// the archive three of them to walk.
+			seedSignalDays(t, db, "2026-09-01", "2026-09-04", "2026-09-05")
 			s := seriesNamed(t, name)
+			planned := planFor(t, db, s, depth).Outstanding
+
 			api := &fakeGarmin{respond: func(c fakeCall, _ int) (json.RawMessage, error) {
 				if strings.Contains(c.path, "socialProfile") {
 					return json.RawMessage(`{"displayName":"testuser"}`), nil
 				}
 				return json.RawMessage(`[]`), nil
 			}}
-			w, _ := newTestWalker(t, db, api, garminWalkOptions{days: days, now: fixedClock("2026-09-08")})
+			w, _ := newTestWalker(t, db, api, garminWalkOptions{depth: depth, now: fixedClock("2026-09-08")})
 			w.walkSeries(context.Background(), s)
 
-			planned := planGarminForwardWork([]garminSeries{s}, end, days)[0].Requests
 			actual := 0
 			for _, c := range api.calls {
 				if !strings.Contains(c.path, "socialProfile") {
@@ -118,40 +114,55 @@ func TestWalkPlan_MatchesTheCallsTheWalkActuallyMakes(t *testing.T) {
 // common case — the sync that runs on a timer — and it is where an accidental
 // per-day walk would hurt most.
 func TestWalkPlan_WeeklyCatchUpIsCheap(t *testing.T) {
-	end := mustParseCivilDay("2026-09-08")
-	const days = 7
+	db := testStore(t)
+	// A week of signal days, and every series already filled through a week
+	// ago: the state a daily timer leaves behind.
+	var week []string
+	for d := mustParseCivilDay("2026-09-02"); !d.after(mustParseCivilDay("2026-09-08")); d = d.addDays(1) {
+		week = append(week, d.String())
+	}
+	seedSignalDays(t, db, week...)
+	for _, s := range garminSeriesCatalog() {
+		if s.kind != seriesWindowed && s.kind != seriesPerDay {
+			continue
+		}
+		if err := db.SaveGarminSeriesState(store.GarminSeriesState{
+			Series: s.name, EarliestDay: "2020-01-01", LastCompleteDay: "2026-09-01",
+		}); err != nil {
+			t.Fatalf("seed state for %s: %v", s.name, err)
+		}
+	}
 
-	ranged := 0
-	perDay := 0
-	for _, p := range planGarminForwardWork(garminSeriesCatalog(), end, days) {
-		switch p.Kind {
-		case "windowed":
-			ranged += p.Requests
-		case "per_day":
-			perDay += p.Requests
+	ranged, perDay := 0, 0
+	for _, s := range garminSeriesCatalog() {
+		plan := planFor(t, db, s, garminDepth{})
+		switch s.kind {
+		case seriesWindowed:
+			ranged += plan.Outstanding
+		case seriesPerDay:
+			perDay += plan.Outstanding
 		}
 	}
 	if ranged != 6 {
 		t.Fatalf("the six ranged series cost %d requests for a 7-day catch-up, want 6 (one window each)", ranged)
 	}
+	// Seven signal days per series, of which the refresh window would
+	// re-ask at most seven: four series, seven days each.
 	if perDay != 28 {
-		t.Fatalf("the four per-day series cost %d requests for 7 days, want 28", perDay)
+		t.Fatalf("the four per-day series cost %d requests for 7 signal days, want 28", perDay)
 	}
-	// At the 300 ms default a weekly catch-up of the ranged and per-day
-	// series is a ten-second job, not a minutes-long one.
 	budget := time.Duration(ranged+perDay) * 300 * time.Millisecond
 	if budget > 15*time.Second {
 		t.Fatalf("a weekly catch-up would pace at %s; that is too slow for a routine sync", budget)
 	}
 }
 
-// A deep first backfill of the ranged series must stay in the seconds-to-
-// minutes range the design assumed, not degrade into thousands of requests.
-func TestWalkPlan_SixYearBackfillStaysBounded(t *testing.T) {
-	// The live reference account's steps reach 2020-07-06.
-	from := mustParseCivilDay("2020-07-06")
+// The full fill of the ranged series starts at Garmin's 2007 history floor.
+// That is the deliberate cost of a gap-proof fill (N131 decision D15): it must
+// stay in the minutes, not the hours.
+func TestWalkPlan_FullFillFromTheHistoryFloorStaysBounded(t *testing.T) {
+	from := garminHistoryFloor
 	to := mustParseCivilDay("2026-09-08")
-	totalDays := daysInclusive(from, to)
 
 	requests := 0
 	for _, s := range garminSeriesCatalog() {
@@ -160,52 +171,38 @@ func TestWalkPlan_SixYearBackfillStaysBounded(t *testing.T) {
 		}
 		requests += len(planForwardWindows(from, to, s.windowDays))
 	}
-	if requests > 300 {
-		t.Fatalf("a %d-day backfill of the ranged series costs %d requests; the window sizes have regressed", totalDays, requests)
+	if requests > 900 {
+		t.Fatalf("a fill from the 2007 floor costs %d windowed requests; the window sizes have regressed", requests)
 	}
 	paced := time.Duration(requests) * 300 * time.Millisecond
-	if paced > 2*time.Minute {
-		t.Fatalf("a full backfill would pace at %s, beyond the minutes-scale job the design sized for", paced)
+	if paced > 10*time.Minute {
+		t.Fatalf("a full fill would pace at %s, beyond the minutes-scale job the design sized for", paced)
 	}
-	t.Logf("full backfill of the ranged series: %d days, %d requests, ~%s at 300ms pacing", totalDays, requests, paced.Round(time.Second))
+	t.Logf("full fill of the ranged series from the history floor: %d requests, ~%s at 300ms pacing", requests, paced.Round(time.Second))
 }
 
-// The empty-window ceiling bounds how far past the end of history a backward
-// walk keeps asking. Without it, an account with no wearable would walk to
-// the 2007 floor.
-func TestWalkPlan_EmptyWindowCeilingBoundsAPointlessWalk(t *testing.T) {
+// The per-day series are the expensive shape, and signal days are what keeps
+// them affordable: an archive with no readings costs nothing at all, and one
+// with a handful of recorded days costs a handful of requests rather than one
+// per calendar day since 2007.
+func TestWalkPlan_PerDaySeriesCostSignalDaysNotCalendarDays(t *testing.T) {
 	db := testStore(t)
-	api := &fakeGarmin{respond: func(fakeCall, int) (json.RawMessage, error) {
-		return json.RawMessage(`[{"calendarDate":"2026-09-08","totalSteps":1}]`), nil
-	}}
-	// Seed a series that has produced data, so the ceiling is allowed to
-	// stand as a history claim.
-	w, _ := newTestWalker(t, db, api, garminWalkOptions{days: 28, now: fixedClock("2026-09-08")})
-	w.walkSeries(context.Background(), seriesNamed(t, "steps"))
-	callsAfterSeed := len(api.calls)
-
-	api.respond = func(fakeCall, int) (json.RawMessage, error) { return json.RawMessage(`[]`), nil }
-	back, _ := newTestWalker(t, db, api, garminWalkOptions{
-		days: 28, backfill: true, emptyWindowCeiling: 13, now: fixedClock("2026-09-08"),
-	})
-	back.walkSeries(context.Background(), seriesNamed(t, "steps"))
-
-	backwardCalls := len(api.calls) - callsAfterSeed
-	// One forward window (today) plus exactly the ceiling's worth of
-	// backward probes.
-	if backwardCalls > 15 {
-		t.Fatalf("the backward walk made %d requests against an empty history; the 13-window ceiling must bound it (a walk to the 2007 floor is %d windows)",
-			backwardCalls, len(planForwardWindows(mustParseCivilDay("2007-01-01"), mustParseCivilDay("2026-09-08"), 28)))
+	empty := planFor(t, db, seriesNamed(t, "sleep_detail"), sinceAll())
+	if empty.Outstanding != 0 {
+		t.Fatalf("a per-day series on an archive with no readings plans %d requests, want 0", empty.Outstanding)
 	}
-	st, _ := db.GetGarminSeriesState("steps")
-	if st.StopReason != "empty_window_ceiling" {
-		t.Fatalf("stop_reason = %q, want empty_window_ceiling", st.StopReason)
+
+	seedSignalDays(t, db, "2020-07-06", "2020-07-07", "2026-09-05")
+	filled := planFor(t, db, seriesNamed(t, "sleep_detail"), sinceAll())
+	if filled.Outstanding != 3 {
+		t.Fatalf("three signal days plan %d requests, want 3 — the 2 253 calendar days between them are not asked for", filled.Outstanding)
 	}
 }
 
 // The displayName lookup is a per-run cost, not a per-request one.
 func TestWalk_ResolvesDisplayNameOncePerRun(t *testing.T) {
 	db := testStore(t)
+	seedSignalDays(t, db, "2026-09-05", "2026-09-06")
 	profileCalls := 0
 	api := &fakeGarmin{respond: func(c fakeCall, _ int) (json.RawMessage, error) {
 		if strings.Contains(c.path, "socialProfile") {
@@ -214,7 +211,7 @@ func TestWalk_ResolvesDisplayNameOncePerRun(t *testing.T) {
 		}
 		return json.RawMessage(`{}`), nil
 	}}
-	w, _ := newTestWalker(t, db, api, garminWalkOptions{days: 10, now: fixedClock("2026-09-08")})
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{depth: sinceDay("2026-08-30"), now: fixedClock("2026-09-08")})
 	for _, name := range []string{"resting_hr", "daily_summary"} {
 		w.walkSeries(context.Background(), seriesNamed(t, name))
 	}
