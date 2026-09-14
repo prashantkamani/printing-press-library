@@ -81,16 +81,17 @@ request at 28 days (sleep stats, sleep score, steps), 364-day windows where it d
 VO2 max, intensity minutes), and one request per day for the per-day series (daily summary, sleep
 detail, daily HR, training readiness), asked only for the days a cheaper series already shows a
 reading for. It also pages the activity feed and fans out over it for the per-activity fetches
-(detail, splits, HR zones), and keeps the account's heart-rate-zone configuration.
+(detail, splits, HR zones), which cover the activities that start on or after the day the run
+starts from, and keeps the account's heart-rate-zone configuration.
 
 How far back to go is the only choice it offers: `--since all` for everything the account holds,
 `--since YYYY-MM-DD` to start there, and neither to keep the depth the archive already has and catch
 up to today. A later, deeper `--since` extends the archive downward without re-fetching the range
-already filled. Before the per-activity and per-day fetches — the expensive half of a run — it
-prints what they will cost in requests, time and disk; `--dry-run` prints the same thing without
-fetching anything, and `--status` reports what each series already holds and still owes. `history`
-is the only command that fills the archive; the generated `sync` verb is superseded and prints a
-pointer to `history`.
+already filled, the per-activity fetches with it. Before the per-activity and per-day fetches — the
+expensive half of a run — it prints what they will cost in requests, time and disk; `--dry-run`
+prints the same thing without fetching anything, and `--status` reports what each series already
+holds and still owes. `history` is the only command that fills the archive; the generated `sync`
+verb is superseded and prints a pointer to `history`.
 
 **account** — Bootstrap and identity: social profile, unit settings, and the account email a login is checked against.
 
@@ -155,6 +156,18 @@ garmin-pp-cli which "<capability in your own words>"
 `which` resolves a natural-language capability query to the best matching command from this CLI's curated feature index. Exit code `0` means at least one match; exit code `2` means no confident match — fall back to `--help` or use a narrower query. `--json` (and other machine formats) keep that exit-2 contract and write `{"matches":[]}` on stdout so agents can inspect the envelope without treating a miss as success.
 
 ## Recipes
+
+### Before you run `history`
+
+```bash
+garmin-pp-cli history --dry-run
+```
+
+The daily statistics start at 2007-01-01, the oldest day Garmin answers for, whatever the account's age: the years before the account existed cost one request per window and store nothing. The activity feed starts at the account's first activity. The per-day series ask only for days a cheaper series or an activity already shows a reading for, and the per-activity fetches — detail, splits and heart-rate zones — cover only activities that start on or after the day the run starts from.
+
+One request covers a 28-day or 364-day window of a daily series, one activity for each of the three per-activity fetches, or one signal day for each of the four per-day series. Each request takes about 0.4 s — a fixed pause plus Garmin's answer. A first fill of an account worn daily for years is several thousand requests, about an hour and a few hundred MB on disk; a sparse account is about a thousand requests and under ten minutes.
+
+`history --dry-run` prints the same estimate line the real run prints before its expensive half, and makes no request at all. `--since YYYY-MM-DD` starts there instead and can be deepened later without re-fetching what is already stored. Interrupting a run is safe: run it again and it picks up whatever is still missing.
 
 ### First fill, and what to do if it stops
 

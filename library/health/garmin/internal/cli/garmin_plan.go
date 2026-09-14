@@ -231,6 +231,109 @@ func (p *garminPlanner) perDayFloor(st store.GarminSeriesState) civilDay {
 	}
 }
 
+// fanOutFloor is the oldest parent start day a per-activity fan-out fetches a
+// child for on this run — the same floor the parent feed itself walks from, so
+// "how far back" stays one dimension rather than one for the feed and another
+// for everything hanging off it (N131 decision D16).
+//
+// A zero day means the run is unbounded and every stored parent is in range.
+// That is the honest answer for --since all, and it is also the right one for a
+// plain run whose feed has no filled range yet: the feed's own floor is then
+// the account's first activity, which no stored parent can predate, so the
+// bounded set and every stored parent are the same set — and deriving it from
+// the saved state rather than from a probe is what keeps this function free of
+// the network the walker's floor resolution needs.
+func (p *garminPlanner) fanOutFloor(s garminSeries) (civilDay, error) {
+	switch p.depth.mode {
+	case depthFrom:
+		return p.depth.day, nil
+	case depthStored:
+		st, err := p.db.GetGarminSeriesState(garminParentSeriesName(s.parentResource))
+		if err != nil {
+			return civilDay{}, err
+		}
+		if garminSeriesFilled(st) {
+			return mustDay(st.EarliestDay), nil
+		}
+	}
+	return civilDay{}, nil
+}
+
+// garminParentSeriesName is the series whose state says how deep the archive's
+// parents reach. A fan-out names its parent by resource and series state is
+// keyed by series name; the catalog holds exactly one series per resource
+// (asserted by TestSeriesCatalog_IsInternallyConsistent), so the series writing
+// that resource is the one whose range applies.
+func garminParentSeriesName(parentResource string) string {
+	for _, c := range garminSeriesCatalog() {
+		if c.resource == parentResource {
+			return c.name
+		}
+	}
+	return parentResource
+}
+
+// garminFanOut is the set of parents a per-activity fan-out may fetch a child
+// for this run.
+type garminFanOut struct {
+	// ids are the parents in range, newest synced first — the order
+	// --max-dependents truncates, so a capped run fetches the newest first.
+	ids []string
+	// stored is how many parents the archive holds at all, before the bound.
+	// It is what tells "nothing is stored yet" apart from "nothing is in
+	// range", which are different facts with different remedies.
+	stored int
+	// floor is the oldest start day this run fetches children for; zero means
+	// unbounded.
+	floor civilDay
+	// unreadable counts stored parents whose payload carries no readable
+	// start day. A bounded run cannot place them on either side of its floor,
+	// so it does not fetch them and says how many it left.
+	unreadable int
+}
+
+// fanOutParents answers "which parents may this run fetch children for", from
+// the archive alone. Both the walk and the plan call it, so the estimate line,
+// --dry-run, --status and the run itself cannot disagree about what a fan-out
+// is about to cost.
+func (p *garminPlanner) fanOutParents(s garminSeries) (garminFanOut, error) {
+	parents, err := p.db.ResourceIDsNewestFirst(s.parentResource, 0)
+	if err != nil {
+		return garminFanOut{}, err
+	}
+	fan := garminFanOut{ids: parents, stored: len(parents)}
+	floor, err := p.fanOutFloor(s)
+	if err != nil {
+		return garminFanOut{}, err
+	}
+	// The floor is stamped before the empty-archive short circuit on purpose:
+	// an archive with no parents yet is exactly the first --dry-run a new user
+	// runs, and the note it prints has to say where the fan-out will start
+	// rather than describe an unbounded one.
+	fan.floor = floor
+	if floor.isZero() || len(parents) == 0 {
+		return fan, nil
+	}
+	days, err := p.db.ResourceIDJSONFieldValues(s.parentResource, garminActivityDayField)
+	if err != nil {
+		return garminFanOut{}, err
+	}
+	kept := make([]string, 0, len(parents))
+	for _, id := range parents {
+		day, ok := dayFromValue(days[id])
+		if !ok {
+			fan.unreadable++
+			continue
+		}
+		if day.before(floor) {
+			continue
+		}
+		kept = append(kept, id)
+	}
+	fan.ids = kept
+	return fan, nil
+}
+
 // garminPerDayWork is what one per-day series owes: the days to request, in
 // ascending order, and the oldest day the run will have covered when it ends.
 type garminPerDayWork struct {
@@ -389,11 +492,15 @@ func (p *garminPlanner) seriesPlan(s garminSeries) (garminSeriesPlan, error) {
 			plan.Since = p.depth.day.String()
 		}
 	case seriesPerParent:
-		parents, parentErr := p.db.ResourceIDsNewestFirst(s.parentResource, 0)
-		if parentErr != nil {
-			return garminSeriesPlan{}, parentErr
+		// Bound, then difference, then cap — the walk's own order. Bounding
+		// after the difference would count parents this run will never ask
+		// for, and capping before either would report the cap rather than
+		// the work.
+		fan, fanErr := p.fanOutParents(s)
+		if fanErr != nil {
+			return garminSeriesPlan{}, fanErr
 		}
-		missing, missingErr := p.db.MissingResourceIDs(s.resource, parents)
+		missing, missingErr := p.db.MissingResourceIDs(s.resource, fan.ids)
 		if missingErr != nil {
 			return garminSeriesPlan{}, missingErr
 		}
@@ -404,6 +511,15 @@ func (p *garminPlanner) seriesPlan(s garminSeries) (garminSeriesPlan, error) {
 		plan.Outstanding = outstanding
 		plan.Bytes = int64(outstanding) * bytesPerRow
 		plan.Note = "one request per " + s.parentNoun + " with no row yet"
+		if !fan.floor.isZero() {
+			plan.Note = "one request per " + s.parentNoun + " starting on or after " +
+				fan.floor.String() + " with no row yet"
+		}
+		// Since stays blank on purpose. It is read as "the archive ends up
+		// covering this day onward" and added into the estimate line's own
+		// minimum, and a fan-out's floor is where its parents start rather
+		// than how deep the archive reaches; the bound is in the note, which
+		// no arithmetic reads.
 	case seriesSingleDocument:
 		plan.Outstanding = 1
 		plan.Bytes = bytesPerRow

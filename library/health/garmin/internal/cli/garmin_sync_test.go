@@ -892,6 +892,355 @@ func TestWalkPerParent_ProgressWindowReportsTheUncappedRemainder(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Fan-outs bounded by the run's floor (N131 decision D16)
+// ---------------------------------------------------------------------------
+
+// seedActivity is one feed row: the id the fan-out keys by, and the day the
+// bound reads out of the payload.
+type seedActivity struct{ id, day string }
+
+// seedActivityDays writes feed rows the way walkActivities stores them: keyed
+// by activityId, carrying the startTimeLocal the bound and the signal-day union
+// both derive their day from. A day of "" writes no startTimeLocal at all,
+// which is what a row archived before the feed carried one looks like.
+func seedActivityDays(t *testing.T, db *store.Store, acts ...seedActivity) {
+	t.Helper()
+	for _, a := range acts {
+		payload := `{"activityId":` + a.id + `}`
+		if a.day != "" {
+			payload = `{"activityId":` + a.id + `,"startTimeLocal":"` + a.day + ` 06:11:00"}`
+		}
+		if err := db.Upsert("activities", a.id, json.RawMessage(payload)); err != nil {
+			t.Fatalf("seed activity %s: %v", a.id, err)
+		}
+	}
+}
+
+// seedFilledFeedState gives the activity feed the filled range a plain run
+// keeps its depth from.
+func seedFilledFeedState(t *testing.T, db *store.Store, earliest, lastComplete string) {
+	t.Helper()
+	if err := db.SaveGarminSeriesState(store.GarminSeriesState{
+		Series: "activities", EarliestDay: earliest, LastCompleteDay: lastComplete,
+	}); err != nil {
+		t.Fatalf("seed feed state: %v", err)
+	}
+}
+
+// activityDetailResponder answers every per-activity request with a document
+// carrying the id that was asked for.
+func activityDetailResponder() func(fakeCall, int) (json.RawMessage, error) {
+	return func(c fakeCall, _ int) (json.RawMessage, error) {
+		return json.RawMessage(`{"activityId":"` + requestedActivityID(c.path) + `","summaryDTO":{"distance":5000}}`), nil
+	}
+}
+
+// requestedActivityID reads the parent id back out of a child request path.
+func requestedActivityID(path string) string {
+	const prefix = "/activity-service/activity/"
+	rest := strings.TrimPrefix(path, prefix)
+	if i := strings.Index(rest, "/"); i >= 0 {
+		rest = rest[:i]
+	}
+	return rest
+}
+
+// fetchedActivityIDs is every parent a fan-out actually requested, in order.
+func fetchedActivityIDs(api *fakeGarmin) []string {
+	var out []string
+	for _, c := range api.calls {
+		out = append(out, requestedActivityID(c.path))
+	}
+	return out
+}
+
+// --since DATE bounds a fan-out the same way it bounds the feed: an activity
+// that started before the floor is not fetched, and stays outstanding for the
+// deeper run that asks for it (D16).
+func TestWalkPerParent_SinceDateBoundsTheFanOutToActivitiesOnOrAfterTheFloor(t *testing.T) {
+	db := testStore(t)
+	seedActivityDays(t, db,
+		seedActivity{"101", "2026-08-30"},
+		seedActivity{"102", "2026-09-02"},
+		seedActivity{"103", "2026-09-05"},
+	)
+	api := &fakeGarmin{respond: activityDetailResponder()}
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{
+		depth: sinceDay("2026-09-02"), now: fixedClock("2026-09-08"),
+	})
+	out := w.walkSeries(context.Background(), seriesNamed(t, "activity_detail"))
+	if out.errored {
+		t.Fatalf("bounded fan-out errored: %v", out.err)
+	}
+	got := fetchedActivityIDs(api)
+	want := map[string]bool{"102": true, "103": true}
+	if len(got) != len(want) {
+		t.Fatalf("fetched %v, want exactly the two activities on or after 2026-09-02", got)
+	}
+	for _, id := range got {
+		if !want[id] {
+			t.Fatalf("fetched activity %s, which started before the --since floor", id)
+		}
+	}
+	// The excluded parent is left outstanding rather than marked done: a
+	// deeper --since later has to be able to pick it up.
+	missing, err := db.MissingResourceIDs("activity_detail", []string{"101"})
+	if err != nil {
+		t.Fatalf("missing ids: %v", err)
+	}
+	if len(missing) != 1 {
+		t.Fatal("the activity below the floor was recorded as fetched; a deeper run would skip it forever")
+	}
+}
+
+// --since all is literal: every stored parent, including one archived before
+// the feed row carried a start day.
+func TestWalkPerParent_SinceAllFetchesEveryStoredParent(t *testing.T) {
+	db := testStore(t)
+	seedActivityDays(t, db,
+		seedActivity{"201", "2011-10-29"},
+		seedActivity{"202", "2026-09-05"},
+		seedActivity{"203", ""},
+	)
+	api := &fakeGarmin{respond: activityDetailResponder()}
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{
+		depth: sinceAll(), now: fixedClock("2026-09-08"),
+	})
+	out := w.walkSeries(context.Background(), seriesNamed(t, "activity_detail"))
+	if out.errored {
+		t.Fatalf("unbounded fan-out errored: %v", out.err)
+	}
+	if len(api.calls) != 3 {
+		t.Fatalf("made %d calls, want 3: --since all bounds nothing, not even a row with no start day", len(api.calls))
+	}
+}
+
+// A plain run keeps the depth the archive has, and for a fan-out that depth is
+// the feed's own filled range: the fan-out follows the feed rather than
+// carrying a second answer to "how far back".
+func TestWalkPerParent_PlainRunBoundsTheFanOutAtTheFeedsFilledRange(t *testing.T) {
+	db := testStore(t)
+	seedFilledFeedState(t, db, "2026-09-01", "2026-09-07")
+	seedActivityDays(t, db,
+		seedActivity{"301", "2026-08-20"},
+		seedActivity{"302", "2026-09-01"},
+		seedActivity{"303", "2026-09-06"},
+	)
+	api := &fakeGarmin{respond: activityDetailResponder()}
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{now: fixedClock("2026-09-08")})
+	out := w.walkSeries(context.Background(), seriesNamed(t, "activity_detail"))
+	if out.errored {
+		t.Fatalf("plain fan-out errored: %v", out.err)
+	}
+	got := fetchedActivityIDs(api)
+	if len(got) != 2 {
+		t.Fatalf("fetched %v, want the two activities inside the feed's filled range from 2026-09-01", got)
+	}
+	for _, id := range got {
+		if id == "301" {
+			t.Fatal("fetched an activity older than the feed's filled range; the fan-out invented its own depth")
+		}
+	}
+}
+
+// The cap is a safety valve over the bounded work, not a second bound: it
+// truncates what is in range, and the progress line reports what is left of
+// that same set.
+func TestWalkPerParent_MaxDependentsCapsTheBoundedSet(t *testing.T) {
+	db := testStore(t)
+	seedActivityDays(t, db,
+		seedActivity{"401", "2026-08-01"},
+		seedActivity{"402", "2026-09-03"},
+		seedActivity{"403", "2026-09-04"},
+		seedActivity{"404", "2026-09-05"},
+	)
+	api := &fakeGarmin{respond: activityDetailResponder()}
+	var buf strings.Builder
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{
+		depth: sinceDay("2026-09-02"), maxDependents: 2, now: fixedClock("2026-09-08"),
+	})
+	w.emit = &garminEmitter{w: &buf, machine: true}
+	out := w.walkSeries(context.Background(), seriesNamed(t, "activity_detail"))
+	if out.errored {
+		t.Fatalf("capped bounded fan-out errored: %v", out.err)
+	}
+	if len(api.calls) != 2 {
+		t.Fatalf("made %d calls, want 2: the cap truncates the three in-range activities", len(api.calls))
+	}
+	for _, id := range fetchedActivityIDs(api) {
+		if id == "401" {
+			t.Fatal("the cap let through an activity below the floor")
+		}
+	}
+	if !strings.Contains(buf.String(), "max_dependents_cap_hit") {
+		t.Fatalf("the cap did not warn: %s", buf.String())
+	}
+	// 3 in range, 2 fetched: the remainder is one, not the two a caller
+	// would read if the out-of-range activity were still being counted.
+	if !strings.Contains(buf.String(), `"window":"1 pending"`) {
+		t.Fatalf("progress window did not report the bounded remainder: %s", buf.String())
+	}
+}
+
+// The estimate line, --dry-run and --status all come from the planner, and the
+// requests come from the walk. They are one function apart on purpose: a plan
+// that counted a different set from the one the walk asks for is exactly the
+// promise this step exists to keep.
+func TestFanOutPlanAndWalkCountTheSameBoundedSet(t *testing.T) {
+	db := testStore(t)
+	seedFilledFeedState(t, db, "2026-09-02", "2026-09-07")
+	seedActivityDays(t, db,
+		seedActivity{"501", "2026-08-15"},
+		seedActivity{"502", "2026-09-02"},
+		seedActivity{"503", "2026-09-04"},
+		seedActivity{"504", "2026-09-06"},
+	)
+	if err := db.Upsert("activity_detail", "504", json.RawMessage(`{"activityId":"504"}`)); err != nil {
+		t.Fatalf("seed an already-archived child: %v", err)
+	}
+	s := seriesNamed(t, "activity_detail")
+	opts := garminWalkOptions{now: fixedClock("2026-09-08")}
+	planner := newTestPlanner(db, opts)
+	planned, err := planner.seriesPlan(s)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	api := &fakeGarmin{respond: activityDetailResponder()}
+	w, _ := newTestWalker(t, db, api, opts)
+	out := w.walkSeries(context.Background(), s)
+	if out.errored {
+		t.Fatalf("fan-out errored: %v", out.err)
+	}
+	if planned.Outstanding != len(api.calls) {
+		t.Fatalf("the plan promised %d requests and the walk made %d; --dry-run and --status would be lying about this fan-out",
+			planned.Outstanding, len(api.calls))
+	}
+	if planned.Outstanding != 2 {
+		t.Fatalf("outstanding = %d, want 2: four stored activities, one below the feed's range, one already archived", planned.Outstanding)
+	}
+	if !strings.Contains(planned.Note, "2026-09-02") {
+		t.Fatalf("the plan's note does not say where the fan-out starts: %q", planned.Note)
+	}
+	// The bound belongs in the note, not in the estimate's own arithmetic:
+	// Since is read as how deep the archive ends up reaching.
+	if planned.Since != "" {
+		t.Fatalf("per-parent plan Since = %q; a fan-out floor is not an archive depth", planned.Since)
+	}
+
+	// The first --dry-run a new user runs meets an archive with no parents in
+	// it at all. That plan still has to say where the fan-out starts, or the
+	// one command the docs send a new user to describes an unbounded fan-out.
+	// Plan side only: with nothing stored the walk returns before it can fetch
+	// anything, so there is no second count to compare this one against.
+	t.Run("the plan for an empty archive still names the floor", func(t *testing.T) {
+		empty := testStore(t)
+		emptyPlanner := newTestPlanner(empty, garminWalkOptions{
+			now: fixedClock("2026-09-08"), depth: sinceDay("2026-09-01"),
+		})
+		p, err := emptyPlanner.seriesPlan(s)
+		if err != nil {
+			t.Fatalf("plan an empty archive: %v", err)
+		}
+		if p.Outstanding != 0 {
+			t.Fatalf("outstanding = %d, want 0: nothing is stored to fan out over", p.Outstanding)
+		}
+		if !strings.Contains(p.Note, "2026-09-01") {
+			t.Fatalf("the first dry-run's note does not say where the fan-out starts: %q", p.Note)
+		}
+	})
+}
+
+// A parent whose start day cannot be read is not silently dropped and not
+// fetched blind: a bounded run cannot place it, says so once with a count, and
+// leaves it outstanding.
+func TestWalkPerParent_UnreadableParentDayWarnsOnceAndIsNotFetched(t *testing.T) {
+	db := testStore(t)
+	seedActivityDays(t, db, seedActivity{"602", "2026-09-05"})
+	for _, id := range []string{"601", "603"} {
+		if err := db.Upsert("activities", id,
+			json.RawMessage(`{"activityId":`+id+`,"startTimeLocal":"not a date"}`)); err != nil {
+			t.Fatalf("seed unreadable activity: %v", err)
+		}
+	}
+	api := &fakeGarmin{respond: activityDetailResponder()}
+	var buf strings.Builder
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{
+		depth: sinceDay("2026-09-02"), now: fixedClock("2026-09-08"),
+	})
+	w.emit = &garminEmitter{w: &buf, machine: true}
+	out := w.walkSeries(context.Background(), seriesNamed(t, "activity_detail"))
+	if out.errored {
+		t.Fatalf("fan-out errored: %v", out.err)
+	}
+	if got := fetchedActivityIDs(api); len(got) != 1 || got[0] != "602" {
+		t.Fatalf("fetched %v, want only the activity whose start day reads", got)
+	}
+	if !out.warned {
+		t.Fatal("two unplaceable parents were skipped without the series warning")
+	}
+	warnings := 0
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		var probe map[string]any
+		if err := json.Unmarshal([]byte(line), &probe); err != nil {
+			t.Fatalf("emitted a line that is not JSON: %s", line)
+		}
+		if probe["reason"] == "parent_day_unreadable" {
+			warnings++
+			if msg, _ := probe["message"].(string); !strings.Contains(msg, "2 stored activities") {
+				t.Fatalf("the warning does not name how many were skipped: %q", msg)
+			}
+		}
+	}
+	if warnings != 1 {
+		t.Fatalf("emitted %d parent_day_unreadable warnings, want exactly 1 for the run", warnings)
+	}
+}
+
+// A floor above every stored activity leaves the fan-out nothing to ask for.
+// That is the caller's own choice answered exactly, so it must not come back
+// as the warning for a series that has never proven it can store anything.
+func TestWalkPerParent_BoundedToNothingDoesNotClaimAnUnprovenZero(t *testing.T) {
+	db := testStore(t)
+	seedActivityDays(t, db, seedActivity{"701", "2026-08-30"})
+	api := &fakeGarmin{respond: func(fakeCall, int) (json.RawMessage, error) {
+		t.Fatal("no activity is in range; nothing should be requested")
+		return nil, nil
+	}}
+	var buf strings.Builder
+	w, _ := newTestWalker(t, db, api, garminWalkOptions{
+		depth: sinceDay("2026-09-02"), now: fixedClock("2026-09-08"),
+	})
+	w.emit = &garminEmitter{w: &buf, machine: true}
+	out := w.walkSeries(context.Background(), seriesNamed(t, "activity_detail"))
+	if out.errored {
+		t.Fatalf("an empty bounded set must not error: %v", out.err)
+	}
+	if strings.Contains(buf.String(), "series_returned_no_rows") {
+		t.Fatalf("a bounded-out fan-out reported an unproven zero: %s", buf.String())
+	}
+}
+
+// Every fan-out reads its depth from the state of the series that writes its
+// parent resource, so the two have to be findable from one another.
+func TestFanOutParentSeriesIsInTheCatalog(t *testing.T) {
+	for _, s := range garminSeriesCatalog() {
+		if s.kind != seriesPerParent {
+			continue
+		}
+		name := garminParentSeriesName(s.parentResource)
+		found := false
+		for _, c := range garminSeriesCatalog() {
+			if c.name == name && c.resource == s.parentResource {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("fan-out %q names parent resource %q, which no catalog series writes; its floor would silently become unbounded", s.name, s.parentResource)
+		}
+	}
+}
+
 func TestWalkSingleDocument_HRZoneConfigKeepsExactlyOneRow(t *testing.T) {
 	db := testStore(t)
 	api := &fakeGarmin{respond: func(c fakeCall, n int) (json.RawMessage, error) {

@@ -434,6 +434,32 @@ func (s *Store) ResourceJSONFieldValues(resourceType, field string) ([]string, e
 	return out, rows.Err()
 }
 
+// ResourceIDJSONFieldValues returns the same field as ResourceJSONFieldValues,
+// keyed by the row's bare id. A fan-out asks it "which day did each stored
+// parent start on", so a run bounded by a date can decide per parent without
+// loading a single payload, and it reads the same field the parent's own
+// extractor reads rather than a second one that could drift away from it.
+func (s *Store) ResourceIDJSONFieldValues(resourceType, field string) (map[string]string, error) {
+	rows, err := s.db.Query(
+		`SELECT id, json_extract(data, '$.' || ?) FROM resources WHERE resource_type = ?`, field, resourceType)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var id string
+		var v sql.NullString
+		if err := rows.Scan(&id, &v); err != nil {
+			return nil, err
+		}
+		if v.Valid && v.String != "" {
+			out[BareResourceID(id)] = v.String
+		}
+	}
+	return out, rows.Err()
+}
+
 // AverageResourceBytes returns the mean stored size of one resource type's
 // rows and how many rows that mean is over. A caller estimating what a fetch
 // will cost uses it to replace a hand-measured constant with this archive's

@@ -66,7 +66,9 @@ const (
 	seriesPerDay
 	// seriesOffsetPaged is the activity feed: offset paging, no date range.
 	seriesOffsetPaged
-	// seriesPerParent fans out over ids already stored by another series.
+	// seriesPerParent fans out over ids already stored by another series,
+	// bounded by the run's floor: a child is fetched only for a parent whose
+	// own start day is on or after it (N131 decision D16).
 	seriesPerParent
 	// seriesSingleDocument is one request answering for the whole account
 	// rather than for a date or an id: the response is the document, and
@@ -900,6 +902,10 @@ type garminSeriesOutcome struct {
 	warned  bool
 	errored bool
 	err     error
+	// boundedEmpty says this run's floor left the series nothing to ask for.
+	// An empty table is then what the caller asked for rather than a zero
+	// nobody has proven, so the never-stored-a-row warning stays quiet.
+	boundedEmpty bool
 }
 
 type garminWalker struct {
@@ -1628,10 +1634,22 @@ func activityIDOf(item json.RawMessage) string {
 	return ""
 }
 
-// walkPerParent fetches one child document per parent id that has no row in
-// this series yet. The parent ids come from another series' stored rows, so a
-// fan-out never enumerates anything the archive has not already seen, and
-// MissingResourceIDs is what makes a re-run cost only the new parents.
+// walkPerParent fetches one child document per parent id that is in range for
+// this run and has no row in this series yet. The parent ids come from another
+// series' stored rows, so a fan-out never enumerates anything the archive has
+// not already seen, and MissingResourceIDs is what makes a re-run cost only the
+// new parents.
+//
+// In range means the parent's own start day is on or after this run's floor —
+// the same floor the parent feed walks from, resolved by the planner so the
+// estimate and the walk cannot disagree (N131 decision D16). A deeper --since
+// later extends a fan-out exactly like every other series: the bound is
+// recomputed from the depth and the feed's saved range every run, and the
+// id-set difference means only the parents that were out of range last time
+// cost anything.
+//
+// Order: bound, then difference, then cap. --max-dependents stays what it has
+// always been, a per-run safety valve over the work that remains.
 //
 // Each series supplies its own child URL and its own wrapper. The wrapper
 // matters because several of these endpoints answer with a bare array, which
@@ -1639,18 +1657,31 @@ func activityIDOf(item json.RawMessage) string {
 // at all; see the wrapping section above.
 func (w *garminWalker) walkPerParent(ctx context.Context, s garminSeries) garminSeriesOutcome {
 	out := garminSeriesOutcome{series: s.name}
-	parents, err := w.db.ResourceIDsNewestFirst(s.parentResource, 0)
+	fan, err := w.planner.fanOutParents(s)
 	if err != nil {
 		out.errored, out.err = true, err
 		return out
 	}
-	if len(parents) == 0 {
+	if fan.stored == 0 {
 		w.emit.warn(s.name, "parent_table_empty",
 			"no "+s.parentResource+" are stored yet, so there is nothing to fan out over; sync the "+s.parentResource+" series first")
 		out.warned = true
 		return out
 	}
-	missing, err := w.db.MissingResourceIDs(s.resource, parents)
+	if fan.unreadable > 0 {
+		// Named once with its count rather than per parent, and never
+		// fetched blind: a parent this run cannot place against its own
+		// floor is outside the bound until the day it carries can be read.
+		out.warned = true
+		w.emit.warn(s.name, "parent_day_unreadable",
+			fmt.Sprintf("%d stored %s carry no readable %s, so this run could not tell whether they start on or after %s; they were not fetched",
+				fan.unreadable, s.parentResource, garminActivityDayField, fan.floor))
+	}
+	// A run whose floor leaves this fan-out nothing to ask for has asked a
+	// complete question and got an empty answer; walkSeries' never-stored-a-row
+	// warning names two causes, and neither of them is this one.
+	out.boundedEmpty = !fan.floor.isZero() && len(fan.ids) == 0
+	missing, err := w.db.MissingResourceIDs(s.resource, fan.ids)
 	if err != nil {
 		out.errored, out.err = true, err
 		return out
@@ -1783,7 +1814,8 @@ func (w *garminWalker) walkSeries(ctx context.Context, s garminSeries) garminSer
 	// reporting a zero nobody has proven. Say so: the same silence covers
 	// "this account has no such data" and "this tool asked wrong", and a
 	// caller reading an empty table deserves to know which question is open.
-	if !out.errored {
+	// A run whose own floor left the series nothing to ask for is neither.
+	if !out.errored && !out.boundedEmpty {
 		if st, err := w.db.GetGarminSeriesState(s.name); err == nil && st.TotalRows == 0 {
 			out.warned = true
 			w.emit.warn(s.name, "series_returned_no_rows",
@@ -1931,8 +1963,10 @@ bookmark rather than starting again.
 How far back to go is the one choice: --since all fetches everything the
 account holds, --since YYYY-MM-DD starts there instead. With neither, a series
 that already has history keeps the depth it has and only catches up to today.
-A later, deeper --since extends the archive downward without re-fetching what
-is already stored.
+That choice bounds every fetch the run makes, the per-activity detail, splits
+and heart-rate zones included: those cover the activities that start on or
+after the day the run starts from. A later, deeper --since extends the
+archive downward without re-fetching what is already stored.
 
 Before the expensive part of a run — the per-activity and per-day fetches —
 the command prints what it is about to cost in requests, time and disk.

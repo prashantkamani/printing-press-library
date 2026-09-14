@@ -207,6 +207,37 @@ func TestMissingResourceIDs_ReturnsOnlyWhatIsAbsent(t *testing.T) {
 	}
 }
 
+// A fan-out bounded by a date asks this for "which day did each stored parent
+// start on", so it has to key by the id and to leave out a row whose field is
+// absent rather than returning it under an empty day.
+func TestResourceIDJSONFieldValues_KeysEachRowsFieldByItsID(t *testing.T) {
+	db := newSeriesTestStore(t)
+	if _, _, err := db.UpsertKeyedBatch("activities", []KeyedRow{
+		{ID: "1", Data: json.RawMessage(`{"activityId":1,"startTimeLocal":"2026-09-05 06:11:00"}`)},
+		{ID: "2", Data: json.RawMessage(`{"activityId":2,"startTimeLocal":"2011-10-29 07:00:00"}`)},
+		{ID: "3", Data: json.RawMessage(`{"activityId":3}`)},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	days, err := db.ResourceIDJSONFieldValues("activities", "startTimeLocal")
+	if err != nil {
+		t.Fatalf("field values: %v", err)
+	}
+	if len(days) != 2 {
+		t.Fatalf("got %d values, want 2: the row without the field is absent, not empty", len(days))
+	}
+	if days["1"] != "2026-09-05 06:11:00" || days["2"] != "2011-10-29 07:00:00" {
+		t.Fatalf("values = %v", days)
+	}
+	if _, ok := days["3"]; ok {
+		t.Fatal("a row with no such field must not appear at all; an empty day would read as unplaceable rather than unknown")
+	}
+	empty, err := db.ResourceIDJSONFieldValues("activities", "noSuchField")
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("unknown field = (%v, %v), want an empty map and no error", empty, err)
+	}
+}
+
 func TestResourceIDsNewestFirst_RespectsTheLimit(t *testing.T) {
 	db := newSeriesTestStore(t)
 	for _, id := range []string{"1", "2", "3"} {
