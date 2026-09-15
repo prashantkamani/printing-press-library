@@ -19,6 +19,13 @@
 //     `ATTACH DATABASE` from creating a file, and a keyword prefix check does
 //     not stop a leading comment.
 //
+// A third bound is about memory rather than writes: the result budget in
+// internal/mcp/bound marshals a row before it measures it, so one oversized
+// cell is built whole in this process before any cap applies. The connection
+// this command queries on therefore carries SQLITE_LIMIT_LENGTH
+// (garminSQLMaxCellBytes), so SQLite refuses such a value instead of
+// allocating it.
+//
 // One disclosed side effect, and it is not the query's: resolving the default
 // --db goes through garminArchivePath, the resolver `insights` and `history`
 // share, which pins a data.db in a home that has none and renames a single
@@ -38,6 +45,7 @@ package cli
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -46,6 +54,8 @@ import (
 	"github.com/mvanhorn/printing-press-library/library/health/garmin/internal/mcp/bound"
 	"github.com/mvanhorn/printing-press-library/library/health/garmin/internal/sqlguard"
 	"github.com/spf13/cobra"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // garminSQLTables are the tables this help advertises. They are asserted
@@ -66,6 +76,25 @@ var garminSQLTables = []struct {
 	{"garmin_series_state", "one bookmark per series: last_complete_day, earliest_day, frontier_day, stop_reason, total_rows; created by the first history run, so a never-filled archive does not have it yet."},
 	{"sync_state", "the generated per-resource cursor table."},
 }
+
+// garminSQLMaxCellBytes caps the length of any string or blob SQLite will
+// build on this command's connection (SQLITE_LIMIT_LENGTH).
+//
+// The result budget cannot do this job: bound.SQLScanState.Add marshals a row
+// to JSON before comparing it to the 60 000-byte budget, so a single oversized
+// cell is materialised whole in this process before any cap applies — measured
+// against the real archive, `SELECT hex(zeroblob(100000000))` peaked at 1.32 GB
+// RSS and `SELECT group_concat(data) FROM resources` at 626 MB, with neither
+// the byte budget nor the 5 s deadline firing.
+//
+// The value is 4 MiB rather than something near the result budget because this
+// limit also refuses a read that merely TOUCHES a stored value longer than it,
+// even `SELECT length(x)` or `substr(x,1,10)`, which answer SQLITE_TOOBIG. So
+// the cap has to clear the largest archived row with room to spare: the real
+// archive's largest today is 145 795 bytes (sleep_detail), then 109 909
+// (activity_splits). 4 MiB leaves ~28x headroom for a series that grows, while
+// still refusing the values that cost hundreds of megabytes to build.
+const garminSQLMaxCellBytes = 4 << 20
 
 // garminSQLEmptyHint names the command that fills the archive. It is the same
 // sentence `insights` prints, for the same reason: no rows is a legitimate
@@ -218,10 +247,20 @@ func garminSQLQuery(ctx context.Context, dbPath, query string) (garminSQLResult,
 	}
 	defer db.Close() //nolint:errcheck // read-only handle
 
+	// The cell cap binds to one connection, so the query runs on the
+	// connection that carries it rather than on whichever one the pool hands
+	// out. The handle allows a single connection, so this one is also the only
+	// one: every later read here goes through it, not through db.
+	conn, err := garminSQLConn(ctx, db)
+	if err != nil {
+		return garminSQLResult{}, err
+	}
+	defer conn.Close() //nolint:errcheck // read-only connection
+
 	queryCtx, cancel := bound.WithSQLQueryDeadline(ctx)
 	defer cancel()
 
-	rows, err := db.QueryContext(queryCtx, query)
+	rows, err := conn.QueryContext(queryCtx, query)
 	if err != nil {
 		return garminSQLResult{}, garminSQLQueryError(queryCtx, err)
 	}
@@ -269,7 +308,7 @@ func garminSQLQuery(ctx context.Context, dbPath, query string) (garminSQLResult,
 		// empty or the query simply did not match decides which hint the
 		// caller prints, and a second open of a live WAL database to count
 		// rows buys nothing.
-		result.archiveEmpty = garminArchiveIsEmpty(ctx, db)
+		result.archiveEmpty = garminArchiveIsEmpty(ctx, conn)
 	}
 	if result.Columns == nil {
 		result.Columns = []string{}
@@ -327,15 +366,31 @@ func openGarminArchiveReadOnly(ctx context.Context, dbPath string) (*sql.DB, err
 	return db, nil
 }
 
+// garminSQLConn checks out the connection the query will run on and caps the
+// length of any value SQLite will build on it. sqlite.Limit binds to this
+// connection instance rather than to the pool, so the cap has to be set here
+// and the query has to use this same connection.
+func garminSQLConn(ctx context.Context, db *sql.DB) (*sql.Conn, error) {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("opening a read-only connection to the local archive: %w", err)
+	}
+	if _, err := sqlite.Limit(conn, sqlite3.SQLITE_LIMIT_LENGTH, garminSQLMaxCellBytes); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("capping the value size on the archive connection: %w", err)
+	}
+	return conn, nil
+}
+
 // garminArchiveIsEmpty reports whether the archive holds no rows at all, so
 // "no rows" can be answered with the hint that names the fill command rather
 // than with a hint about the caller's WHERE clause. A missing resources table
 // is a database that was never filled, which is the same answer. Any other
 // failure reads as not-empty, which leaves the caller with the hint about its
 // own query — the safe answer when the probe itself could not speak.
-func garminArchiveIsEmpty(ctx context.Context, db *sql.DB) bool {
+func garminArchiveIsEmpty(ctx context.Context, conn *sql.Conn) bool {
 	var n int
-	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM resources`).Scan(&n); err != nil {
+	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM resources`).Scan(&n); err != nil {
 		return isMissingArchive(err)
 	}
 	return n == 0
@@ -353,6 +408,9 @@ func garminSQLValue(v any) any {
 }
 
 func garminSQLQueryError(queryCtx context.Context, err error) error {
+	if isSQLValueTooBig(err) {
+		return fmt.Errorf("query failed: %w. One value in the result was longer than the %d MiB per-value cap this command sets, so SQLite refused to build it rather than holding it in memory; ask for a slice instead — substr(data,1,4000), json_extract(data,'$.field'), or a narrower LIMIT", err, garminSQLMaxCellBytes>>20)
+	}
 	if queryCtx.Err() != nil {
 		return fmt.Errorf("query cancelled: %w. Queries are bounded to %s; narrow it with WHERE, GROUP BY, or an aggregate", err, bound.SQLQueryTimeout)
 	}
@@ -360,6 +418,20 @@ func garminSQLQueryError(queryCtx context.Context, err error) error {
 		return fmt.Errorf("query failed: %w. Most archived rows live in resources(resource_type, id, data), not one table per series: filter by resource_type and read fields with json_extract(data,'$.field'). Run 'garmin-pp-cli sql --help' for the table list", err)
 	}
 	return fmt.Errorf("query failed: %w", err)
+}
+
+// isSQLValueTooBig reports whether SQLite refused a value for exceeding
+// SQLITE_LIMIT_LENGTH. The driver surfaces every step failure as *sqlite.Error
+// with the result code (SQLITE_TOOBIG = 18) from (*rows).Next, and
+// database/sql passes it through unwrapped, so the code is the whole test: a
+// text match would also claim an unrelated error whose SQL happens to quote
+// the phrase.
+func isSQLValueTooBig(err error) bool {
+	if err == nil {
+		return false
+	}
+	var coded interface{ Code() int }
+	return errors.As(err, &coded) && coded.Code() == sqlite3.SQLITE_TOOBIG
 }
 
 // printGarminSQLTable prints the same tab-separated shape the generated

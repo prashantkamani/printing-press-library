@@ -19,7 +19,8 @@ import (
 	"testing"
 
 	"github.com/mvanhorn/printing-press-library/library/health/garmin/internal/store"
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // ---------------------------------------------------------------------------
@@ -577,5 +578,176 @@ func TestGarminSQLIsRegisteredOnRoot(t *testing.T) {
 	}
 	if found.Hidden {
 		t.Fatal("sql is hidden; it is a user-facing escape hatch")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Cell-size cap
+//
+// bound.SQLScanState.Add marshals a row to JSON before comparing it to the
+// 60 000-byte budget, so a single oversized cell is fully materialised in this
+// process before any cap can apply: `SELECT hex(zeroblob(100000000))` peaked at
+// 1.32 GB RSS against the real archive and neither the byte budget nor the 5 s
+// deadline fired. The fix is one layer lower — SQLITE_LIMIT_LENGTH on the
+// connection the query runs on, so SQLite refuses the value instead of building
+// it. These cases pin that refusal and the headroom it has to leave.
+// ---------------------------------------------------------------------------
+
+// newBigCellFixture is newWALFixture plus the rows the cap cases need: five
+// 1 MiB rows whose concatenation clears 4 MiB, and one ~200 KB JSON row that
+// must stay readable because the cap refuses any read that *touches* a stored
+// value over the limit, not just one that returns it.
+func newBigCellFixture(t *testing.T) string {
+	t.Helper()
+	path := newWALFixture(t)
+	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("opening fixture writer: %v", err)
+	}
+	defer db.Close() //nolint:errcheck // fixture
+
+	blob := strings.Repeat("a", 200*1024)
+	if _, err := db.Exec(
+		`INSERT INTO resources (id, resource_type, data) VALUES ('2026-02-01','sleep_detail',?)`,
+		`{"note":"`+blob+`"}`,
+	); err != nil {
+		t.Fatalf("seeding the 200 KB row: %v", err)
+	}
+	mib := strings.Repeat("b", 1<<20)
+	for i := 0; i < 5; i++ {
+		if _, err := db.Exec(
+			`INSERT INTO resources (id, resource_type, data) VALUES (?, 'bulk', ?)`,
+			fmt.Sprintf("row-%d", i), mib,
+		); err != nil {
+			t.Fatalf("seeding bulk row %d: %v", i, err)
+		}
+	}
+	return path
+}
+
+// assertCellCapRefusal pins the wording: a refusal that does not name the cap
+// and a narrower way to ask leaves the caller guessing why a valid SELECT
+// failed.
+func assertCellCapRefusal(t *testing.T, err error, out string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("an oversized cell was accepted; output: %.200s", out)
+	}
+	msg := err.Error()
+	for _, want := range []string{"4 MiB", "substr(", "json_extract("} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("refusal does not mention %q: %v", want, err)
+		}
+	}
+}
+
+// TestGarminSQLRefusesAnOversizedComputedCell is the defect case: before the
+// cap this query returned a 200 MB hex string with truncated:true, after
+// materialising it whole in this process.
+func TestGarminSQLRefusesAnOversizedComputedCell(t *testing.T) {
+	dbPath := newWALFixture(t)
+
+	t.Run("first-row", func(t *testing.T) {
+		out, _, err := runSQLCommand(t, dbPath, `SELECT hex(zeroblob(100000000)) AS v`)
+		assertCellCapRefusal(t, err, out)
+	})
+
+	// The refusal has two possible sites — the query call and the scan loop —
+	// and only one of them is reached when the very first row is the oversized
+	// one. A query whose second row is the big one covers the other, so a
+	// mid-iteration refusal cannot regress into a bare error that names neither
+	// the cap nor a narrower way to ask.
+	t.Run("later-row", func(t *testing.T) {
+		out, _, err := runSQLCommand(t, dbPath,
+			`SELECT hex(zeroblob(CASE v WHEN 1 THEN 10 ELSE 100000000 END)) AS v FROM (SELECT 1 AS v UNION ALL SELECT 2)`)
+		assertCellCapRefusal(t, err, out)
+	})
+}
+
+// TestGarminSQLRefusesAnOversizedGroupConcat is the same defect reached through
+// stored rows rather than zeroblob: group_concat builds one value out of many
+// modest ones.
+func TestGarminSQLRefusesAnOversizedGroupConcat(t *testing.T) {
+	dbPath := newBigCellFixture(t)
+	out, _, err := runSQLCommand(t, dbPath, `SELECT group_concat(data) AS v FROM resources WHERE resource_type='bulk'`)
+	assertCellCapRefusal(t, err, out)
+}
+
+// TestGarminSQLCapLeavesHeadroomForStoredRows is why the cap is 4 MiB and not
+// something near the 60 000-byte result budget: SQLITE_LIMIT_LENGTH also
+// refuses a read that merely touches a stored value larger than the limit, so
+// a cap under the largest archived row would make that row unreadable even by
+// length() or json_extract().
+func TestGarminSQLCapLeavesHeadroomForStoredRows(t *testing.T) {
+	dbPath := newBigCellFixture(t)
+
+	out, _, err := runSQLCommand(t, dbPath, `SELECT length(data) AS n FROM resources WHERE resource_type='sleep_detail'`)
+	if err != nil {
+		t.Fatalf("length() over a 200 KB stored row was refused: %v", err)
+	}
+	result := decodeSQLResult(t, out)
+	if result.Count != 1 {
+		t.Fatalf("length() returned %d rows: %s", result.Count, out)
+	}
+	if got, ok := result.Rows[0]["n"].(float64); !ok || int(got) < 200*1024 {
+		t.Fatalf("length(data) = %#v, want the ~200 KB row's length", result.Rows[0]["n"])
+	}
+
+	out, _, err = runSQLCommand(t, dbPath, `SELECT length(json_extract(data,'$.note')) AS n FROM resources WHERE resource_type='sleep_detail'`)
+	if err != nil {
+		t.Fatalf("json_extract over a 200 KB stored row was refused: %v", err)
+	}
+	if result = decodeSQLResult(t, out); result.Count != 1 {
+		t.Fatalf("json_extract returned %d rows: %s", result.Count, out)
+	}
+	if got, ok := result.Rows[0]["n"].(float64); !ok || int(got) != 200*1024 {
+		t.Fatalf("length(json_extract(...)) = %#v, want the ~200 KB payload's length", result.Rows[0]["n"])
+	}
+}
+
+// TestGarminSQLCellCapBoundary pins the cap where the constant says it is: a
+// value just under it answers, one just over it is refused.
+func TestGarminSQLCellCapBoundary(t *testing.T) {
+	dbPath := newWALFixture(t)
+
+	out, _, err := runSQLCommand(t, dbPath, fmt.Sprintf(`SELECT length(zeroblob(%d)) AS n`, garminSQLMaxCellBytes-16))
+	if err != nil {
+		t.Fatalf("a cell just under the cap was refused: %v", err)
+	}
+	// The envelope round-trips through JSON, so a length arrives as a float.
+	result := decodeSQLResult(t, out)
+	got, ok := result.Rows[0]["n"].(float64)
+	if !ok || int(got) != garminSQLMaxCellBytes-16 {
+		t.Fatalf("under-cap cell reported length %#v, want %d", result.Rows[0]["n"], garminSQLMaxCellBytes-16)
+	}
+
+	out, _, err = runSQLCommand(t, dbPath, fmt.Sprintf(`SELECT length(zeroblob(%d)) AS n`, garminSQLMaxCellBytes+16))
+	assertCellCapRefusal(t, err, out)
+}
+
+// TestGarminSQLConnCarriesTheCellCap proves the limit is set on the connection
+// the query actually runs on. Limits bind to the connection instance, not the
+// pool, so a cap set on any other connection would be decorative.
+func TestGarminSQLConnCarriesTheCellCap(t *testing.T) {
+	dbPath := newWALFixture(t)
+	db, err := openGarminArchiveReadOnly(context.Background(), dbPath)
+	if err != nil {
+		t.Fatalf("opening read-only handle: %v", err)
+	}
+	defer db.Close() //nolint:errcheck // test handle
+
+	conn, err := garminSQLConn(context.Background(), db)
+	if err != nil {
+		t.Fatalf("preparing the query connection: %v", err)
+	}
+	defer conn.Close() //nolint:errcheck // test connection
+
+	// newVal < 0 reads the current limit without changing it.
+	got, err := sqlite.Limit(conn, sqlite3.SQLITE_LIMIT_LENGTH, -1)
+	if err != nil {
+		t.Fatalf("reading SQLITE_LIMIT_LENGTH back: %v", err)
+	}
+	if got != garminSQLMaxCellBytes {
+		t.Fatalf("SQLITE_LIMIT_LENGTH = %d on the query connection, want %d", got, garminSQLMaxCellBytes)
 	}
 }
