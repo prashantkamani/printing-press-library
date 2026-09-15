@@ -142,11 +142,15 @@ func TestSchemaVersion_StampedOnFreshDB(t *testing.T) {
 
 // TestOpenAppliesPragmas pins the connection-string contract: the store
 // must use the profile-selected journal mode with a non-zero busy_timeout and
-// disabled mmap so the main database file stays pread-based. The read-only
-// handle reports delete journal mode because immutable=1 skips the WAL-index
-// mmap that mmap_size does not govern. It fails the instant the DSN
-// regresses to the mattn-style pragma form, which modernc.org/sqlite
-// silently drops.
+// disabled mmap so the main database file stays pread-based. It fails the
+// instant the DSN regresses to the mattn-style pragma form, which
+// modernc.org/sqlite silently drops.
+//
+// HAND-EDITED (N131.5.5 review F-5): the read-only handle asserted journal
+// mode "delete", which was immutable=1 reporting that it had not attached the
+// -shm WAL-index. Without immutable=1 the handle reads the WAL — and so must
+// report "wal" — and query_only(true) is what now keeps it read-only above the
+// driver's own mode=ro check.
 func TestOpenAppliesPragmas(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "data.db")
 	s, err := Open(dbPath)
@@ -160,18 +164,18 @@ func TestOpenAppliesPragmas(t *testing.T) {
 
 	// The read-only handle (MCP sql/search, analytics) must carry the
 	// busy_timeout so it waits on a concurrent writer rather than erroring,
-	// keep mmap disabled, and skip the WAL-index. immutable=1 makes even a
-	// WAL file report delete journal mode because the connection does not
-	// attach the -shm mapping.
+	// keep mmap disabled, and read the WAL so a live writer's committed frames
+	// are visible.
 	ro, err := OpenReadOnly(dbPath)
 	if err != nil {
 		t.Fatalf("open read-only: %v", err)
 	}
 	defer ro.Close()
 
-	requirePragma(t, ro.DB(), "journal_mode", "delete")
+	requirePragma(t, ro.DB(), "journal_mode", "wal")
 	requirePragma(t, ro.DB(), "busy_timeout", "5000")
 	requirePragma(t, ro.DB(), "mmap_size", "0")
+	requirePragma(t, ro.DB(), "query_only", "1")
 }
 
 // requirePragma fails the test unless `PRAGMA <name>` reports want. It reads
@@ -188,24 +192,46 @@ func requirePragma(t *testing.T, db *sql.DB, name, want string) {
 	}
 }
 
-// assertNoWALIndexSidecars fails if a read-only open recreated the WAL-index
-// mapping SQLite would otherwise place in -shm. mmap_size(0) does not govern
-// that mapping; the read-only DSN must skip it.
-func assertNoWALIndexSidecars(t *testing.T, dbPath string) {
+// HAND-EDITED (N131.5.5 review F-5) — see .printing-press-patches/.
+//
+// This helper asserted that a read-only open created neither -shm nor -wal,
+// which was a restatement of immutable=1. That flag is gone: it made the MCP
+// sql and search tools miss committed-but-uncheckpointed WAL frames and
+// answer "no such table" for a table that exists (open_readonly_wal_test.go
+// measures both). A mode=ro open of a WAL database maps the -shm WAL-index,
+// so the sidecar may now appear.
+//
+// What the read-only open must still not do is change the database. Both
+// callers capture the file before opening and compare it byte for byte after,
+// and an empty -wal beside it is the only sidecar content allowed.
+func snapshotDatabaseFile(t *testing.T, dbPath string) string {
 	t.Helper()
-	for _, sidecar := range []string{dbPath + "-shm", dbPath + "-wal"} {
-		if _, err := os.Stat(sidecar); err == nil {
-			t.Fatalf("read-only open created WAL sidecar %s", sidecar)
-		} else if !os.IsNotExist(err) {
-			t.Fatalf("stat %s: %v", sidecar, err)
-		}
+	data, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("reading %s: %v", dbPath, err)
+	}
+	return string(data)
+}
+
+func assertReadOnlyOpenDidNotMutate(t *testing.T, dbPath, before string) {
+	t.Helper()
+	if after := snapshotDatabaseFile(t, dbPath); after != before {
+		t.Fatalf("read-only open changed %s: %d bytes before, %d after", dbPath, len(before), len(after))
+	}
+	if fi, err := os.Stat(dbPath + "-wal"); err == nil && fi.Size() != 0 {
+		t.Fatalf("read-only open left %d bytes in %s-wal", fi.Size(), dbPath)
+	} else if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("stat %s-wal: %v", dbPath, err)
 	}
 }
 
 // TestOpenReadOnly_SkipsWALIndexSidecars proves a settled WAL store can be
-// opened read-only without recreating -shm. The current-ro DSN (mmap_size 0
-// without immutable=1) remaps the WAL-index on the next open; that mapping
-// is the concurrent-reader fault surface.
+// opened read-only and read without changing it.
+//
+// HAND-EDITED (N131.5.5 review F-5): the assertion was "creates no -shm",
+// which only restated immutable=1. The DSN now maps the WAL-index on purpose
+// so the handle sees a live writer's committed frames; the database file
+// itself must still come through untouched.
 func TestOpenReadOnly_SkipsWALIndexSidecars(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "data.db")
 	s, err := Open(dbPath)
@@ -215,6 +241,7 @@ func TestOpenReadOnly_SkipsWALIndexSidecars(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatalf("close writer: %v", err)
 	}
+	before := snapshotDatabaseFile(t, dbPath)
 
 	ro, err := OpenReadOnly(dbPath)
 	if err != nil {
@@ -229,7 +256,7 @@ func TestOpenReadOnly_SkipsWALIndexSidecars(t *testing.T) {
 	if n < 1 {
 		t.Fatalf("read-only query returned empty catalog")
 	}
-	assertNoWALIndexSidecars(t, dbPath)
+	assertReadOnlyOpenDidNotMutate(t, dbPath, before)
 }
 
 // TestOpenReadOnly_ConcurrentProcesses runs two sibling read-only processes
@@ -252,6 +279,7 @@ func TestOpenReadOnly_ConcurrentProcesses(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatalf("close seed: %v", err)
 	}
+	before := snapshotDatabaseFile(t, dbPath)
 
 	const helpers = 2
 	cmds := make([]*exec.Cmd, helpers)
@@ -271,7 +299,7 @@ func TestOpenReadOnly_ConcurrentProcesses(t *testing.T) {
 			t.Fatalf("helper %d: %v", i, err)
 		}
 	}
-	assertNoWALIndexSidecars(t, dbPath)
+	assertReadOnlyOpenDidNotMutate(t, dbPath, before)
 }
 
 func runOpenReadOnlyHelper() {

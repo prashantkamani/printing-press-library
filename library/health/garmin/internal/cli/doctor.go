@@ -370,49 +370,20 @@ func newDoctorCmd(flags *rootFlags) *cobra.Command {
 
 			// Human-readable output with color
 			w := cmd.OutOrStdout()
-			checkKeys := []struct{ key, label string }{
-				{"config", "Config"},
-				{"auth", "Auth"},
-				{"env_vars", "Env Vars"},
-				{"verify_mode", "Verify Mode"},
-				{"paths_warning", "Paths"},
-				{"credentials_location_warning", "Credentials Storage"},
-				{"api", "API"},
-				{"credentials", "Credentials"},
-			}
-			for _, ck := range checkKeys {
+			for _, ck := range doctorCheckKeys {
 				v, ok := report[ck.key]
 				if !ok {
 					continue
 				}
 				s := fmt.Sprintf("%v", v)
 				indicator := green("OK")
-				switch {
-				case strings.HasPrefix(s, "WARN"):
-					indicator = yellow("WARN")
-				case strings.HasPrefix(s, "INFO"):
-					indicator = yellow("INFO")
-				case strings.HasPrefix(s, "ERROR"):
+				switch doctorCheckIndicator(s) {
+				case doctorIndicatorFail:
 					indicator = red("FAIL")
-				case strings.HasPrefix(s, "refused:"):
-					indicator = red("FAIL")
-				case strings.HasPrefix(s, "optional"):
-					// Optional-auth CLI with no key set — informational, not a failure.
-					indicator = yellow("INFO")
-				case strings.Contains(s, "scope-limited"):
+				case doctorIndicatorWarn:
 					indicator = yellow("WARN")
-				case strings.Contains(s, "not verified"):
-					// "present, not verified" — credentials are loaded but no
-					// probe ran. Informational, not a warning; a clean config
-					// shouldn't render yellow WARN in CI dashboards.
+				case doctorIndicatorInfo:
 					indicator = yellow("INFO")
-				case strings.Contains(s, "error") || strings.Contains(s, "not configured") || strings.Contains(s, "unreachable") || strings.Contains(s, "invalid") || strings.Contains(s, "missing"):
-					indicator = red("FAIL")
-				case s == "not required":
-					// Public APIs: no auth needed is a healthy state, not a warning.
-					indicator = green("OK")
-				case strings.Contains(s, "not ") || strings.Contains(s, "skipped") || strings.Contains(s, "inferred"):
-					indicator = yellow("WARN")
 				}
 				fmt.Fprintf(w, "  %s %s: %s\n", indicator, ck.label, s)
 			}
@@ -608,6 +579,66 @@ func legacyCredentialProbePaths(cfg *config.Config) []string {
 	return paths
 }
 
+// doctorCheckKeys are the report keys doctor renders with a status indicator,
+// in render order. Every other key is printed as plain information.
+var doctorCheckKeys = []struct{ key, label string }{
+	{"config", "Config"},
+	{"auth", "Auth"},
+	{"env_vars", "Env Vars"},
+	{"verify_mode", "Verify Mode"},
+	{"paths_warning", "Paths"},
+	{"credentials_location_warning", "Credentials Storage"},
+	{"api", "API"},
+	{"credentials", "Credentials"},
+}
+
+// The four verdicts doctorCheckIndicator returns. FAIL and WARN are what the
+// human report prints beside a check; INFO and OK are not failures.
+const (
+	doctorIndicatorOK   = "OK"
+	doctorIndicatorInfo = "INFO"
+	doctorIndicatorWarn = "WARN"
+	doctorIndicatorFail = "FAIL"
+)
+
+// doctorCheckIndicator classifies one rendered check value. It is the single
+// source of the verdict printed beside a check AND of the --fail-on gate, so a
+// line the tool prints as FAIL cannot exit 0 under --fail-on error (N131.5.5
+// F-1: "not configured" matched none of the gate's own tokens).
+//
+// Case order is load-bearing: "not configured" must reach the FAIL case before
+// the general "not " WARN case below it.
+func doctorCheckIndicator(s string) string {
+	switch {
+	case strings.HasPrefix(s, "WARN"):
+		return doctorIndicatorWarn
+	case strings.HasPrefix(s, "INFO"):
+		return doctorIndicatorInfo
+	case strings.HasPrefix(s, "ERROR"):
+		return doctorIndicatorFail
+	case strings.HasPrefix(s, "refused:"):
+		return doctorIndicatorFail
+	case strings.HasPrefix(s, "optional"):
+		// Optional-auth CLI with no key set — informational, not a failure.
+		return doctorIndicatorInfo
+	case strings.Contains(s, "scope-limited"):
+		return doctorIndicatorWarn
+	case strings.Contains(s, "not verified"):
+		// "present, not verified" — credentials are loaded but no probe ran.
+		// Informational, not a warning; a clean config shouldn't render yellow
+		// WARN in CI dashboards.
+		return doctorIndicatorInfo
+	case strings.Contains(s, "error") || strings.Contains(s, "not configured") || strings.Contains(s, "unreachable") || strings.Contains(s, "invalid") || strings.Contains(s, "missing"):
+		return doctorIndicatorFail
+	case s == "not required":
+		// Public APIs: no auth needed is a healthy state, not a warning.
+		return doctorIndicatorOK
+	case strings.Contains(s, "not ") || strings.Contains(s, "skipped") || strings.Contains(s, "inferred"):
+		return doctorIndicatorWarn
+	}
+	return doctorIndicatorOK
+}
+
 // doctorExitForFailOn returns a non-nil error when the report's worst
 // status meets the --fail-on gate. "error" trips on failing sections, "warn"
 // trips on deliberate WARN sections plus errors, and "stale" trips on cache
@@ -619,6 +650,21 @@ func doctorExitForFailOn(failOn string, report map[string]any) error {
 	worstError := false
 	worstWarn := false
 	worstStale := false
+	// The checks the human report prints an indicator for are judged by the
+	// same classifier that prints it, so FAIL and WARN mean the same thing on
+	// stdout and at the exit code.
+	for _, ck := range doctorCheckKeys {
+		s, ok := report[ck.key].(string)
+		if !ok {
+			continue
+		}
+		switch doctorCheckIndicator(s) {
+		case doctorIndicatorFail:
+			worstError = true
+		case doctorIndicatorWarn:
+			worstWarn = true
+		}
+	}
 	for _, v := range report {
 		s, ok := v.(string)
 		if ok {

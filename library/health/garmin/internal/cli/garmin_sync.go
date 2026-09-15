@@ -2135,7 +2135,12 @@ each series already holds.`,
 	cmd.Flags().IntVar(&maxConsecutiveFailures, "max-consecutive-failures", defaultMaxConsecutiveFailures,
 		"End the run when this many requests fail in a row. A whole run failing usually means the credential stopped being accepted or the service is refusing this client, not that these requests were unlucky.")
 	cmd.Flags().StringVar(&dbPath, "db", "", "SQLite database file path. The default is this home's data directory data.db, which is named for the home rather than for the credential in use, so a token refresh never orphans it; pass --db to read or write a different file.")
-	for _, hidden := range []string{"series", "delay", "max-pages", "max-dependents", "page-size", "strict", "max-consecutive-failures", "db"} {
+	// --strict is NOT in this list (N131 decision D21). "Exit non-zero when a
+	// series fails" is a choice about how a caller wants the run to end, not an
+	// implementation detail: a scripted or scheduled fill needs it, and a
+	// hidden flag is one a caller cannot discover. Everything still hidden is
+	// a knob whose right value this command already knows.
+	for _, hidden := range []string{"series", "delay", "max-pages", "max-dependents", "page-size", "max-consecutive-failures", "db"} {
 		if err := cmd.Flags().MarkHidden(hidden); err != nil {
 			panic("history: " + err.Error())
 		}

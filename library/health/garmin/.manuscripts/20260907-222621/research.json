@@ -87,7 +87,16 @@
       "description": "Fills a local SQLite archive of every Garmin daily series from the oldest day forward, keeping one bookmark per series so an interrupted run resumes instead of restarting.",
       "rationale": "Garmin caps every daily-stats request at 28 days and answers the per-day series one date at a time, so years of history exist only where something walked the calendar and stored them.",
       "example": "garmin-pp-cli history --since all",
-      "why_it_matters": "Run this before any question that reaches past the last 28 days: `--since all` or `--since YYYY-MM-DD` is the only depth control it offers, `--status` reports what each series still owes, and every insights command reads the archive rather than the API.",
+      "why_it_matters": "Run this before any question that reaches past the last 28 days: `--since all` or `--since YYYY-MM-DD` is the only depth control it offers, `--status` reports what each series still owes, `--strict` makes a scheduled run exit non-zero instead of warning past a series that did not answer, and every insights command reads the archive rather than the API.",
+      "group": "Local state that compounds"
+    },
+    {
+      "name": "SQL over the whole archive, read-only by construction",
+      "command": "sql",
+      "description": "Ask the archive anything in SQL: one read-only SELECT across every series `history` has filled.",
+      "rationale": "The archive is a local SQLite file, so a question nobody anticipated is a query rather than a feature request, and Garmin's own API answers no aggregate and no join.",
+      "example": "garmin-pp-cli sql \"SELECT substr(json_extract(data,'$.startTimeLocal'),1,7) AS month, count(*) AS activities, round(sum(json_extract(data,'$.duration'))/3600.0,1) AS hours FROM resources WHERE resource_type='activities' GROUP BY month ORDER BY month DESC LIMIT 12\" --agent",
+      "why_it_matters": "Reach for this when the question is neither the sleep nor the training recipe: one SELECT joins any two series on the id they share, and a single-statement gate over a mode=ro, query_only handle means no query can write, whatever it says.",
       "group": "Local state that compounds"
     },
     {
@@ -125,7 +134,16 @@
       "description": "Fills a local SQLite archive of every Garmin daily series from the oldest day forward, keeping one bookmark per series so an interrupted run resumes instead of restarting.",
       "rationale": "Garmin caps every daily-stats request at 28 days and answers the per-day series one date at a time, so years of history exist only where something walked the calendar and stored them.",
       "example": "garmin-pp-cli history --since all",
-      "why_it_matters": "Run this before any question that reaches past the last 28 days: `--since all` or `--since YYYY-MM-DD` is the only depth control it offers, `--status` reports what each series still owes, and every insights command reads the archive rather than the API.",
+      "why_it_matters": "Run this before any question that reaches past the last 28 days: `--since all` or `--since YYYY-MM-DD` is the only depth control it offers, `--status` reports what each series still owes, `--strict` makes a scheduled run exit non-zero instead of warning past a series that did not answer, and every insights command reads the archive rather than the API.",
+      "group": "Local state that compounds"
+    },
+    {
+      "name": "SQL over the whole archive, read-only by construction",
+      "command": "sql",
+      "description": "Ask the archive anything in SQL: one read-only SELECT across every series `history` has filled.",
+      "rationale": "The archive is a local SQLite file, so a question nobody anticipated is a query rather than a feature request, and Garmin's own API answers no aggregate and no join.",
+      "example": "garmin-pp-cli sql \"SELECT substr(json_extract(data,'$.startTimeLocal'),1,7) AS month, count(*) AS activities, round(sum(json_extract(data,'$.duration'))/3600.0,1) AS hours FROM resources WHERE resource_type='activities' GROUP BY month ORDER BY month DESC LIMIT 12\" --agent",
+      "why_it_matters": "Reach for this when the question is neither the sleep nor the training recipe: one SELECT joins any two series on the id they share, and a single-statement gate over a mode=ro, query_only handle means no query can write, whatever it says.",
       "group": "Local state that compounds"
     },
     {
@@ -208,7 +226,7 @@
     "recipes": [
       {
         "title": "Before you run `history`",
-        "command": "garmin-pp-cli history --dry-run",
+        "command": "garmin-pp-cli history --since all --dry-run",
         "explanation": "The dry run prints the same estimate the real run prints before its expensive half, and makes no request at all, so read it before committing to the fill. What it is counting: the daily series start at 2007-01-01, the oldest day Garmin answers for whatever the account's age, and the activity feed starts at the account's first activity; one request covers a 28-day or 364-day window of a daily series, one activity for each of the three per-activity fetches, or one signal day for each of the four per-day series, and each request takes about 0.4 s. An account worn daily for years comes to several thousand requests, about an hour, and a few hundred MB on disk; a sparse account is about a thousand requests and under ten minutes. The per-activity fetches — detail, splits and heart-rate zones — cover only the activities that start on or after the day the run starts from, so a later, deeper `--since` extends them downward along with the daily series. When the estimate reads acceptable, start the fill with `garmin-pp-cli history --since all`."
       },
       {
@@ -222,9 +240,9 @@
         "explanation": "Totals, a per-type breakdown and the heart-rate-zone split in one read; drop the `--select` to also see `coverage.activities_with_zones`, which is how many of those activities were recorded with a strap."
       },
       {
-        "title": "Count the archive by any stored field",
-        "command": "garmin-pp-cli analytics --type activities --group-by activityName --limit 10 --agent",
-        "explanation": "`analytics` counts rows of any archived resource type, grouped by one top-level field of the stored JSON — `activities`, `sleep_stats`, `steps`, `training_readiness` and the other series `history` fills. Activity names are free text, so this grouping shows which workouts the account repeats under the same name rather than a tidy per-type histogram, and nested fields such as `activityType.typeKey` are out of reach because the grouping resolves top-level keys only. `search \u003ctext\u003e --type activities --data-source local` is the full-text equivalent over the same rows."
+        "title": "Join two series the recipes do not join",
+        "command": "garmin-pp-cli sql \"SELECT a.id AS activity_id, json_extract(a.data,'$.activityType.typeKey') AS type, round(json_extract(a.data,'$.distance')/1000.0,2) AS km, json_extract(z.data,'$.zoneCount') AS zones FROM resources a JOIN resources z ON z.resource_type='activity_hr_zones' AND z.id=a.id WHERE a.resource_type='activities' ORDER BY a.id DESC LIMIT 10\" --agent",
+        "explanation": "Every archived series lives in one table, `resources`, keyed by (resource_type, id), so joining two of them is a self-join on the id they share — here the activity feed and the per-activity heart-rate zones. `sql` accepts a single SELECT or WITH statement and runs it against a handle opened read-only, so no query can change the archive whatever it says. Run `garmin-pp-cli sql \"SELECT resource_type, count(*) FROM resources GROUP BY 1\"` first to see which series this archive holds. `analytics --type activities --group-by activityName` stays the shorthand when one top-level field of one series is all you need, and `search \u003ctext\u003e --type activities --data-source local` is the full-text equivalent over the same rows."
       },
       {
         "title": "Connect a second household account",

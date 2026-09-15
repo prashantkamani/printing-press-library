@@ -500,6 +500,11 @@ paths:
           symbol: get_progress_summary_between_dates
       x-class: range
       x-max-window-days-note: No 28-day chunking in any client read for this path; window limit UNVERIFIED.
+      # startDate and endDate are required and carry no default, so the
+      # synthesized example omitted them and printed a command that exits 2
+      # with `required flag "start-date" not set` (N131.5.5 F-5). aggregation
+      # is hidden and defaulted; an example should not teach it.
+      x-pp-example: garmin-pp-cli activities breakdown --start-date 2026-01-01 --end-date 2026-06-30 --metric duration
 
       x-pp-resource: activities
   /biometric-service/heartRateZones:
@@ -1126,11 +1131,22 @@ paths:
         '200':
           description: ZIP archive holding the original FIT file.
           content:
+            # Measured against Garmin on 2026-09-14 (N131.5.5 F-2): this path
+            # answers HTTP 406 NotAcceptableException to
+            # `Accept: application/octet-stream` AND to `Accept:
+            # application/zip`, and serves the ZIP to `Accept: */*` — the body
+            # comes back as `Content-Type: application/x-zip-compressed`, which
+            # is why neither concrete type matched. Declaring
+            # */* beside application/zip is how the spec says so: the generated
+            # response stays binary (any binary media type or string/binary
+            # schema decides that), while the per-endpoint Accept override is
+            # withheld because */* is not a concrete type — leaving the client's
+            # own binary default, which is `*/*`.
             application/zip:
               schema:
                 type: string
                 format: binary
-            application/octet-stream:
+            '*/*':
               schema:
                 type: string
                 format: binary

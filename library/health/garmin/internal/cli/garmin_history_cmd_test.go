@@ -99,7 +99,14 @@ func TestHistory_OnlyDepthAndTheTwoReportsAreVisibleInHelp(t *testing.T) {
 			t.Fatalf("%s is missing from --help:\n%s", visible, help)
 		}
 	}
-	for _, hidden := range []string{"--series", "--delay", "--max-pages", "--max-dependents", "--page-size", "--strict", "--max-consecutive-failures", "--db"} {
+	// --strict is advertised (N131 D21); the rest stay hidden.
+	if !strings.Contains(help, "--strict") {
+		t.Fatalf("--strict is a caller-facing choice and must appear in --help:\n%s", help)
+	}
+	if flag := cmd.Flags().Lookup("strict"); flag == nil || flag.Hidden {
+		t.Fatalf("--strict is missing or still hidden: %#v", flag)
+	}
+	for _, hidden := range []string{"--series", "--delay", "--max-pages", "--max-dependents", "--page-size", "--max-consecutive-failures", "--db"} {
 		if strings.Contains(help, hidden) {
 			t.Fatalf("%s is a mechanism flag and must not appear in --help:\n%s", hidden, help)
 		}

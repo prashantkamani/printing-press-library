@@ -52,8 +52,8 @@
   },
   "wiring_check": {
     "command_tree": {
-      "defined": 96,
-      "registered": 95,
+      "defined": 97,
+      "registered": 96,
       "unregistered": [
         "sync"
       ]
@@ -72,8 +72,8 @@
     }
   },
   "novel_features_check": {
-    "planned": 4,
-    "found": 4
+    "planned": 5,
+    "found": 5
   },
   "mcp_surface_parity": {
     "state": "runtime_walking",
@@ -81,24 +81,24 @@
     "detail": "MCP surface mirrors the Cobra tree at runtime"
   },
   "reimplementation_check": {
-    "checked": 4,
-    "exempted_via_store": 3,
+    "checked": 5,
+    "exempted_via_store": 4,
     "exempted_via_client_directive": 1
   },
   "description_drift_check": {
     "expected": "Your whole Garmin history in a local database, not one 28-day page at a time."
   },
   "source_client_check": {
-    "checked": 9
+    "checked": 10
   },
   "print_json_filtered_check": {
-    "checked": 70
+    "checked": 71
   },
   "test_presence": {
-    "checked": 2
+    "checked": 3
   },
   "naming_check": {
-    "checked": 70
+    "checked": 71
   },
   "sync_param_drop_check": {
     "checked": 0,

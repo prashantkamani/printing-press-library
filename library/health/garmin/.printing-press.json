@@ -60,6 +60,11 @@
       "description": "Fills a local SQLite archive of every Garmin daily series from the oldest day forward, keeping one bookmark per series so an interrupted run resumes instead of restarting."
     },
     {
+      "name": "SQL over the whole archive, read-only by construction",
+      "command": "sql",
+      "description": "Ask the archive anything in SQL: one read-only SELECT across every series `history` has filled."
+    },
+    {
       "name": "Loopback browser login with identity assertion",
       "command": "auth login",
       "description": "Refuses to store a token whose account is not the address you named, so a shared browser cannot sign the wrong household member in."

@@ -26,6 +26,7 @@ import (
 	"github.com/mvanhorn/printing-press-library/library/health/garmin/internal/mcp/bound"
 	"github.com/mvanhorn/printing-press-library/library/health/garmin/internal/mcp/cobratree"
 	"github.com/mvanhorn/printing-press-library/library/health/garmin/internal/platform"
+	"github.com/mvanhorn/printing-press-library/library/health/garmin/internal/sqlguard"
 	"github.com/mvanhorn/printing-press-library/library/health/garmin/internal/store"
 )
 
@@ -93,7 +94,7 @@ func RegisterTools(s *server.MCPServer) {
 			mcplib.WithDestructiveHintAnnotation(false),
 			mcplib.WithOpenWorldHintAnnotation(true),
 		),
-		makeAPIHandler("GET", "/download-service/files/activity/{activityId}", true, true, map[string]string{"Accept": "application/octet-stream"}, mcpPageConfig{}, []mcpParamBinding{{PublicName: "DI-Backend", WireName: "DI-Backend", Location: "header", Default: "connectapi.garmin.com"}, {PublicName: "activityId", WireName: "activityId", Location: "path"}}, []string{"activityId"}),
+		makeAPIHandler("GET", "/download-service/files/activity/{activityId}", true, true, nil, mcpPageConfig{}, []mcpParamBinding{{PublicName: "DI-Backend", WireName: "DI-Backend", Location: "header", Default: "connectapi.garmin.com"}, {PublicName: "activityId", WireName: "activityId", Location: "path"}}, []string{"activityId"}),
 	)
 	s.AddTool(
 		mcplib.NewTool("activities_get",
@@ -924,154 +925,27 @@ func mcpSearchEnvelope(results []json.RawMessage, storeStatus mcpStoreStatusKind
 	return out
 }
 
-// validateReadOnlyQuery gates the MCP sql tool. The agent contract advertised
-// to the host is ReadOnlyHintAnnotation(true); a false annotation on a
-// mutating tool lets MCP hosts auto-approve writes and is treated as a real
-// bug per the project's agent-native security model.
-//
-// The gate rejects multi-statement input, then applies an allowlist (SELECT or
-// WITH only) AFTER stripping the leading whitespace, line comments, block
-// comments, and semicolons that SQLite itself ignores before parsing. A naive
-// HasPrefix check on a keyword blocklist is bypassable by prefixing the
-// dangerous statement with "/* x */" or "-- x\n"; a naive leading-keyword
-// allowlist is bypassable by appending "; ATTACH DATABASE ...". Combined with
-// the empirical fact that modernc.org/sqlite's mode=ro does NOT block VACUUM
-// INTO (writes a snapshot to a new file) or ATTACH DATABASE (opens a separate
-// writable handle), either bypass produces silent exfiltration to an
-// attacker-chosen path.
-//
-// SELECT and WITH are the only allowed leading keywords. WITH supports
-// SELECT-form CTEs; CTE-wrapped writes ("WITH x AS (...) INSERT ...") are
-// caught by OpenReadOnly's mode=ro one layer down. PRAGMA, ATTACH, VACUUM,
-// and every other DDL/DML keyword fail at this gate before reaching SQLite.
+// validateReadOnlyQuery gates the MCP sql tool. The gate itself — the
+// single-statement check, the SELECT/WITH allowlist, and the leading-noise
+// stripping that makes both honest — lives in internal/sqlguard so the
+// `garmin-pp-cli sql` command enforces exactly the same contract with exactly
+// the same wording. NOVEL EDIT to a generated file: see
+// .printing-press-patches/garmin-sql-escape-hatch.json. A re-render restores
+// the three functions inline here; re-apply this delegation, or the two
+// surfaces silently stop sharing one gate.
 func validateReadOnlyQuery(query string) error {
-	stripped := stripLeadingSQLNoise(query)
-	if hasTrailingSQLStatement(stripped) {
-		return fmt.Errorf("only a single SELECT or WITH statement is allowed")
-	}
-	upper := strings.ToUpper(stripped)
-	if !strings.HasPrefix(upper, "SELECT") && !strings.HasPrefix(upper, "WITH") {
-		return fmt.Errorf("only SELECT queries are allowed")
-	}
-	return nil
+	return sqlguard.Validate(query)
 }
 
-// stripLeadingSQLNoise removes leading whitespace, SQL line comments
-// (-- to end of line), block comments (/* ... */), and statement
-// separators (;) from query. SQLite skips these before parsing the first
-// keyword, so a security gate that does not strip them mismatches what the
-// driver actually executes.
+// stripLeadingSQLNoise and hasTrailingSQLStatement stay as names in this
+// package because the generated tests below call them directly; the behaviour
+// they name lives in internal/sqlguard.
 func stripLeadingSQLNoise(query string) string {
-	for {
-		query = strings.TrimLeft(query, " \t\r\n;")
-		switch {
-		case strings.HasPrefix(query, "--"):
-			if idx := strings.IndexByte(query, '\n'); idx >= 0 {
-				query = query[idx+1:]
-				continue
-			}
-			return ""
-		case strings.HasPrefix(query, "/*"):
-			if idx := strings.Index(query[2:], "*/"); idx >= 0 {
-				query = query[2+idx+2:]
-				continue
-			}
-			return ""
-		default:
-			return query
-		}
-	}
+	return sqlguard.StripLeadingSQLNoise(query)
 }
 
-// hasTrailingSQLStatement reports whether query contains a statement
-// terminator followed by more executable SQL. A trailing semicolon is allowed;
-// a second statement is not. Semicolons inside string literals, quoted
-// identifiers, bracket identifiers, and comments are ignored to match SQLite's
-// parser shape closely enough for this security gate.
 func hasTrailingSQLStatement(query string) bool {
-	inSingle := false
-	inDouble := false
-	inBacktick := false
-	inBracket := false
-	inLineComment := false
-	inBlockComment := false
-
-	for i := 0; i < len(query); i++ {
-		ch := query[i]
-		next := byte(0)
-		if i+1 < len(query) {
-			next = query[i+1]
-		}
-
-		switch {
-		case inLineComment:
-			if ch == '\n' {
-				inLineComment = false
-			}
-			continue
-		case inBlockComment:
-			if ch == '*' && next == '/' {
-				inBlockComment = false
-				i++
-			}
-			continue
-		case inSingle:
-			if ch == '\'' {
-				if next == '\'' {
-					i++
-					continue
-				}
-				inSingle = false
-			}
-			continue
-		case inDouble:
-			if ch == '"' {
-				if next == '"' {
-					i++
-					continue
-				}
-				inDouble = false
-			}
-			continue
-		case inBacktick:
-			if ch == '`' {
-				if next == '`' {
-					i++
-					continue
-				}
-				inBacktick = false
-			}
-			continue
-		case inBracket:
-			if ch == ']' {
-				inBracket = false
-			}
-			continue
-		}
-
-		switch {
-		case ch == '-' && next == '-':
-			inLineComment = true
-			i++
-		case ch == '/' && next == '*':
-			inBlockComment = true
-			i++
-		case ch == '\'':
-			inSingle = true
-		case ch == '"':
-			inDouble = true
-		case ch == '`':
-			inBacktick = true
-		case ch == '[':
-			inBracket = true
-		case ch == ';':
-			if stripLeadingSQLNoise(query[i+1:]) != "" {
-				return true
-			}
-			return false
-		}
-	}
-	return false
+	return sqlguard.HasTrailingSQLStatement(query)
 }
 
 func handleSQL(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
@@ -1300,6 +1174,7 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 			{"name": "Sleep over a window, joined and compared", "command": "insights sleep", "description": "Duration, score, stage split and resting heart rate for a window of nights, with the equally long window before it beside them.", "rationale": "Duration, score and stage minutes arrive from three separate Garmin series; only a local archive holds them against the same night, so one read can join them and compare two periods.", "via": "mcp-command-mirror"},
 			{"name": "Training load, zone split and fitness trend in one read", "command": "insights training", "description": "Archived activities grouped by type with their time and distance, time summed per heart-rate zone, weekly load buckets, and the VO2-max and readiness trends beside them.", "rationale": "Zone seconds come from a per-activity endpoint and load from the feed; joining a month of them live costs one request per activity, and from the archive it costs none.", "via": "mcp-command-mirror"},
 			{"name": "Oldest-first archive fill of the 28-day-capped series", "command": "history", "description": "Fills a local SQLite archive of every Garmin daily series from the oldest day forward, keeping one bookmark per series so an interrupted run resumes instead of restarting.", "rationale": "Garmin caps every daily-stats request at 28 days and answers the per-day series one date at a time, so years of history exist only where something walked the calendar and stored them.", "via": "mcp-command-mirror"},
+			{"name": "SQL over the whole archive, read-only by construction", "command": "sql", "description": "Ask the archive anything in SQL: one read-only SELECT across every series `history` has filled.", "rationale": "The archive is a local SQLite file, so a question nobody anticipated is a query rather than a feature request, and Garmin's own API answers no aggregate and no join.", "via": "mcp-command-mirror"},
 			{"name": "Loopback browser login with identity assertion", "command": "auth login", "description": "Refuses to store a token whose account is not the address you named, so a shared browser cannot sign the wrong household member in.", "rationale": "Every other client either takes the password or scrapes a browser cookie; a shared browser session quietly signs in the wrong household member, and only an identity check catches it.", "via": "mcp-command-mirror"},
 		},
 		"playbook": []map[string]string{

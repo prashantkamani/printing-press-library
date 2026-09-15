@@ -110,16 +110,27 @@ func Open(dbPath string) (*Store, error) {
 // delete mode (e.g. a pre-WAL database opened by an old binary before its
 // first read-write open) errors with "attempt to write a readonly database".
 //
-// immutable=1 is the WAL-index control. mmap_size(0) only bounds mmap of the
-// main database file; SQLite still memory-maps the -shm WAL-index for
-// multi-process WAL coordination, and concurrent read-only processes fault
-// inside that mapping. The URI flag tells SQLite this connection will not
-// observe writers, so it skips shared-memory and reads the main file with
-// pread. A WAL writer's last close already checkpoints, so a later
-// immutable reader sees the committed snapshot. Uncheckpointed frames from
-// a still-open writer are invisible; that is the trade for not mapping -shm.
-// nolock=1 and vfs=unix-none cannot open a WAL database; exclusive locking
-// mode serializes clients and fails a mode=ro open.
+// Deliberately NOT immutable=1. That flag tells SQLite the file has no
+// writers, so the connection skips the -shm WAL-index and reads the main
+// file with pread — and therefore cannot see frames a still-open writer has
+// committed but not checkpointed. Measured on a WAL fixture (see
+// open_readonly_wal_test.go): an immutable reader missed a committed row and
+// answered "no such table" for a table whose CREATE lived only in the -wal.
+// This handle backs the MCP sql and search tools, so that is a clean wrong
+// answer to an agent's question; the extra -shm mapping is the price.
+//
+// The cost of dropping it: a mode=ro open of a WAL database whose -shm is
+// absent has to create the -shm beside the file, so it needs a writable
+// containing directory. A read-only directory (GARMIN_HOME on a read-only
+// mount) therefore fails to open rather than returning a stale snapshot.
+//
+// query_only(true) is what keeps the handle read-only for statements the
+// driver would otherwise let through the mode=ro check — the same pragma the
+// `sql` verb's own open uses (internal/cli/garmin_sql.go).
+//
+// mmap_size(0) bounds mmap of the main database file. nolock=1 and
+// vfs=unix-none cannot open a WAL database; exclusive locking mode
+// serializes clients and fails a mode=ro open.
 //
 // OpenReadOnly uses context.Background(); callers holding a context should use
 // OpenReadOnlyContext so a cancelled command (SIGINT, deadline) interrupts the
@@ -131,7 +142,7 @@ func OpenReadOnly(dbPath string) (*Store, error) {
 // OpenReadOnlyContext is OpenReadOnly with a caller-supplied context honored by
 // the driver-init SQLITE_BUSY retry.
 func OpenReadOnlyContext(ctx context.Context, dbPath string) (*Store, error) {
-	dsn := "file:" + dbPath + "?mode=ro&immutable=1&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=temp_store(MEMORY)&_pragma=mmap_size(0)"
+	dsn := "file:" + dbPath + "?mode=ro&_pragma=query_only(true)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=temp_store(MEMORY)&_pragma=mmap_size(0)"
 	if err := ensureSQLiteDriverInitialized(ctx, dsn); err != nil {
 		return nil, err
 	}

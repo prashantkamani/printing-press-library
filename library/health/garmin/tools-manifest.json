@@ -139,12 +139,6 @@
           "description": "Numeric activity id, the `activityId` field of a row from `activities list`.",
           "required": true
         }
-      ],
-      "header_overrides": [
-        {
-          "name": "Accept",
-          "value": "application/octet-stream"
-        }
       ]
     },
     {

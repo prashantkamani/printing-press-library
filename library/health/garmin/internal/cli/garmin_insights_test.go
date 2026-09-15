@@ -412,6 +412,46 @@ func TestInsightsTraining_GroupsByTypeAndSumsZones(t *testing.T) {
 	}
 }
 
+// N131.5.5 F-4: an activity whose archived activity_hr_zones row carries an
+// empty hrTimeInZones list was recorded without a heart-rate strap. Garmin
+// stores the row anyway (measured on the owner archive: every
+// activity_hr_zones row is {"hrTimeInZones":[],"zoneCount":0}), so the
+// presence of the row says nothing about coverage — only the entries do.
+// Counting such a row made coverage.activities_with_zones equal the activity
+// count on a strapless account and made the missing-zones warning unreachable,
+// which is the exact misreading SKILL.md promises the field prevents.
+func TestInsightsTraining_StraplessActivityIsNotCountedAsCovered(t *testing.T) {
+	pinInsightsToday(t, insightsFixtureEnd)
+	path := seededStore(t, func(t *testing.T, db *store.Store) {
+		t.Helper()
+		putRows(t, db, "activities", map[string]json.RawMessage{
+			"2001": activityRow("2001", "2026-03-10 07:00:00", "cycling", 3600, 30000, 100, 140),
+			"2002": activityRow("2002", "2026-03-09 07:00:00", "cycling", 3600, 30000, 100, 0),
+		})
+		putRows(t, db, "activity_hr_zones", map[string]json.RawMessage{
+			// Strapped: five zone entries, 3600 seconds in total.
+			"2001": hrZonesRow("2001", []float64{600, 1200, 1200, 600, 0}),
+			// Strapless: Garmin answered with an empty list, archived as-is.
+			"2002": hrZonesRow("2002", nil),
+		})
+	})
+
+	result, _ := runInsights(t, path, "training", "--days", "7")
+
+	coverage := nested(t, result, "coverage")
+	wantNumber(t, coverage, "activities", 2)
+	wantNumber(t, coverage, "activities_with_zones", 1)
+
+	warnings, ok := result["warnings"].([]any)
+	if !ok {
+		t.Fatalf("expected warnings, got %#v", result["warnings"])
+	}
+	joined := fmt.Sprint(warnings...)
+	if !strings.Contains(joined, "1 of 2 activities have no archived heart-rate zones") {
+		t.Fatalf("expected the missing-zones warning to name the strapless activity, got %v", warnings)
+	}
+}
+
 func TestInsightsTraining_WeeklyBucketsAndFitnessTrend(t *testing.T) {
 	pinInsightsToday(t, insightsFixtureEnd)
 	path := seededStore(t, seedTrainingFixture)

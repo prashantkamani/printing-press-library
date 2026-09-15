@@ -58,7 +58,6 @@ func newActivitiesDownloadOriginalCmd(flags *rootFlags) *cobra.Command {
 				return err
 			}
 			headerOverrides := map[string]string{
-				"Accept":                           "application/octet-stream",
 				"X-Printing-Press-Binary-Response": "true",
 			}
 

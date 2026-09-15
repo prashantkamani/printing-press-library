@@ -932,9 +932,10 @@ func (r *insightsRunner) readActivities(from, to civilDay) []activityRecord {
 	return out
 }
 
-// readHRZones sums seconds per zone across the given activities. The
-// activity_hr_zones series is keyed by activity id, so only the activities in
-// the window contribute — the archive holds zones for older activities too.
+// readHRZones sums seconds per zone across the given activities and returns
+// how many of them actually carry zone entries. The activity_hr_zones series
+// is keyed by activity id, so only the activities in the window contribute —
+// the archive holds zones for older activities too.
 func (r *insightsRunner) readHRZones(activities []activityRecord) (map[int]float64, int) {
 	wanted := make(map[string]struct{}, len(activities))
 	for _, act := range activities {
@@ -957,6 +958,17 @@ func (r *insightsRunner) readHRZones(activities []activityRecord) (map[int]float
 		}
 		var items []json.RawMessage
 		if err := json.Unmarshal(zones, &items); err != nil {
+			continue
+		}
+		// An archived row with an empty hrTimeInZones list is an activity
+		// recorded without a heart-rate strap: Garmin answers [] and the
+		// archive stores it faithfully, so the row exists and covers nothing.
+		// Count the entries, not the row — they are also what feeds the sum
+		// below, so the counter describes exactly what the zone minutes came
+		// from. zoneCount agrees with the entry count on every archived row
+		// measured (owner: 84 rows at 0/0; kavita: 3258 rows, 3173 at 5/5, 85 at 0/0), so the
+		// entries are used rather than a second field that can disagree.
+		if len(items) == 0 {
 			continue
 		}
 		matched++

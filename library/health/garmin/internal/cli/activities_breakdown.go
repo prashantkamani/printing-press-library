@@ -22,7 +22,7 @@ func newActivitiesBreakdownCmd(flags *rootFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:         "breakdown",
 		Short:       "Server-side aggregation of every activity on the account into totals per parent activity type, by duration or distance.",
-		Example:     "  garmin-pp-cli activities breakdown --aggregation lifetime --metric duration",
+		Example:     "  garmin-pp-cli activities breakdown --start-date 2026-01-01 --end-date 2026-06-30 --metric duration",
 		Annotations: map[string]string{"pp:endpoint": "activities.breakdown", "pp:method": "GET", "pp:path": "/fitnessstats-service/activity", "mcp:read-only": "true", "pp:requires-input": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Bare invocation of a command with required input prints help

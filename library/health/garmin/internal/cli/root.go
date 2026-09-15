@@ -303,6 +303,7 @@ Highlights (not in the official API docs):
   • insights sleep   Duration, score, stage split and resting heart rate for a window of nights, with the equally long window before it beside them.
   • insights training   Archived activities grouped by type with their time and distance, time summed per heart-rate zone, weekly load buckets, and the VO2-max and readiness trends beside them.
   • history   Fills a local SQLite archive of every Garmin daily series from the oldest day forward, keeping one bookmark per series so an interrupted run resumes instead of restarting.
+  • sql   Ask the archive anything in SQL: one read-only SELECT across every series 'history' has filled.
   • auth login   Refuses to store a token whose account is not the address you named, so a shared browser cannot sign the wrong household member in.
 
 Agent mode: add --agent to any command for JSON output + non-interactive mode.
@@ -473,6 +474,13 @@ See README.md or the bundled SKILL.md for recipes.`,
 	// NOVEL: local-archive recipes. See internal/cli/garmin_insights.go and
 	// .printing-press-patches/garmin-insights-recipes.json.
 	rootCmd.AddCommand(newGarminInsightsCmd(flags))
+	// NOVEL: the archive's escape hatch — one read-only SELECT for the
+	// questions the two insights recipes do not cover. See
+	// internal/cli/garmin_sql.go and
+	// .printing-press-patches/garmin-sql-escape-hatch.json. The typed MCP
+	// `sql` tool is registered before the Cobra-tree mirror walks this
+	// command, so the mirror skips the name rather than shadowing the tool.
+	rootCmd.AddCommand(newGarminSQLCmd(flags))
 	rootCmd.AddCommand(newTailCmd(flags))
 	rootCmd.AddCommand(newAnalyticsCmd(flags))
 	rootCmd.AddCommand(newWorkflowCmd(flags))
