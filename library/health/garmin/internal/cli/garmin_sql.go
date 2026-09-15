@@ -6,8 +6,11 @@
 //
 // `sql` is the archive's escape hatch. `insights` answers the two questions
 // we knew to ask; this one answers the rest, because no recipe list covers
-// every question somebody will have about their own years of data. It makes
-// no network call, and no query it runs can change the archive:
+// every question somebody will have about their own years of data. The query
+// itself makes no network call; the one network path is the root --deliver
+// flag, which posts the finished envelope to the named sink after the query
+// returns (root.go), exactly as on every other command. No query it runs can
+// change the archive:
 //
 //  1. internal/sqlguard rejects anything that is not one SELECT or WITH
 //     statement, after stripping the comments and semicolons SQLite itself
